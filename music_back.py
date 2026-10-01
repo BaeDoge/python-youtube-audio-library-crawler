@@ -3,7 +3,6 @@ import json
 import random
 import re
 import sqlite3
-import os
 from datetime import datetime
 from pathlib import Path
 
@@ -13,18 +12,9 @@ from playwright.async_api import async_playwright
 CDP_URL = "http://127.0.0.1:9222"
 CHANNEL_ID = "UCzLBIavNT7yYjN1sl1cCnrg"
 STUDIO_URL = f"https://studio.youtube.com/channel/{CHANNEL_ID}/music"
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "tracks.db"
-DOWNLOAD_DIR = BASE_DIR / "downloads"
-
-# 환경변수로 다운로드 개수와 used 파일 위치를 변경할 수 있습니다.
-# 예: DOWNLOAD_COUNT=10 python music.py
-try:
-    DOWNLOAD_COUNT = max(1, int(os.getenv("DOWNLOAD_COUNT", "30")))
-except ValueError:
-    DOWNLOAD_COUNT = 30
-
-USED_FILE = Path(os.getenv("USED_FILE", str(BASE_DIR / "used.txt")))
+DB_PATH = Path(__file__).resolve().parent / "tracks.db"
+DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
+DOWNLOAD_COUNT = 30
 
 GENRE_MAP = {
     "CREATOR_MUSIC_GENRE_ALTERNATIVE": "Alternative",
@@ -73,50 +63,6 @@ def display_genre(genre):
     return GENRE_MAP.get(genre, genre)
 
 
-def display_mood(mood):
-    """YouTube 내부 mood 값이 enum 형태여도 폴더명은 읽기 쉽게 만듭니다."""
-    mood = str(mood or "").strip()
-    if not mood:
-        return "Unknown Mood"
-
-    prefix = "CREATOR_MUSIC_MOOD_"
-    if mood.startswith(prefix):
-        mood = mood[len(prefix):]
-
-    return mood.replace("_", " ").title()
-
-
-def get_moods(row):
-    """tracks.moods(JSON 배열)에서 mood를 가져옵니다. 여러 개면 첫 번째를 사용합니다."""
-    try:
-        value = json.loads(row["moods"] or "[]")
-        if isinstance(value, list):
-            moods = [str(x).strip() for x in value if str(x).strip()]
-            if moods:
-                return moods[0]
-    except (TypeError, json.JSONDecodeError):
-        pass
-
-    value = str(row["moods"] or "").strip()
-    if value:
-        return value.split(",")[0].strip()
-
-    return "UNKNOWN"
-
-
-def load_used_titles():
-    """used.txt의 곡 제목을 읽습니다. 빈 줄과 # 주석은 무시합니다."""
-    if not USED_FILE.exists():
-        return set()
-
-    titles = set()
-    for line in USED_FILE.read_text(encoding="utf-8-sig").splitlines():
-        title = " ".join(line.strip().split())
-        if title and not title.startswith("#"):
-            titles.add(title.casefold())
-    return titles
-
-
 def get_genres():
     conn = db()
     rows = conn.execute(
@@ -145,13 +91,7 @@ def get_tracks_by_genre(genre):
           AND track_id NOT IN (SELECT track_id FROM downloaded_tracks)
     """, (f'%"{genre}"%',)).fetchall()
     conn.close()
-
-    # used.txt에 등록된 제목은 다운로드 대상에서 제외합니다.
-    used_titles = load_used_titles()
-    return [
-        row for row in rows
-        if " ".join((row["title"] or "").strip().split()).casefold() not in used_titles
-    ]
+    return rows
 
 
 def get_history():
@@ -281,12 +221,7 @@ async def download_one(context, captured, row, index, total, genre):
     try:
         url = await get_download_url(context.request, captured, track_id)
         base = f"{safe_filename(artist)} - {safe_filename(title)}"
-        mood = get_moods(row)
-        DOWNLOAD_FULL_DIR = (
-            DOWNLOAD_DIR
-            / safe_filename(display_genre(genre))
-            / safe_filename(display_mood(mood))
-        )
+        DOWNLOAD_FULL_DIR = DOWNLOAD_DIR / display_genre(genre)
         DOWNLOAD_FULL_DIR.mkdir(parents=True, exist_ok=True)
         path = DOWNLOAD_FULL_DIR / f"{base}.mp3"
         if path.exists():
@@ -357,7 +292,7 @@ async def download_by_genre(context, captured):
 
     available = get_tracks_by_genre(genre)
     if not available:
-        print("해당 장르에 미다운로드 곡이 없습니다. (used.txt 제외)")
+        print("해당 장르에 미다운로드 곡이 없습니다.")
         return
 
     count = min(DOWNLOAD_COUNT, len(available))
@@ -417,7 +352,7 @@ async def main():
             print("=" * 54)
             show_status()
             print("1. 장르 목록")
-            print(f"2. 장르 선택 → 랜덤 {DOWNLOAD_COUNT}곡 다운로드")
+            print("2. 장르 선택 → 랜덤 30곡 다운로드")
             print("3. 다운로드 이력")
             print("0. 종료")
             choice = input("\n선택: ").strip()
