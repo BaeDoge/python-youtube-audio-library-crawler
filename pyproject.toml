@@ -1,11 +1,13 @@
 [project]
 name = "yt-music-store"
 version = "0.1.0"
-description = "Local YouTube Studio music metadata collector and downloader"
+description = "Local YouTube Studio music metadata collector and playlist builder"
 requires-python = ">=3.11"
+
 dependencies = [
     "playwright>=1.50.0",
     "httpx>=0.27.0",
+    "python-dotenv>=1.2.0",
 ]
 
 [tool.uv]

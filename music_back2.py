@@ -104,6 +104,7 @@ PREFERRED_TRACK_DURATION = env_int(
     240,
 )
 
+# 같은 총 재생시간이라면 어떤 플레이리스트를 선택할지에 영향을 줍니다.
 DURATION_SCORE_WEIGHT = env_float(
     "SCORING_DURATION_WEIGHT",
     10.0,
@@ -129,11 +130,14 @@ RANDOMNESS_WEIGHT = env_float(
     0.5,
 )
 
+# 하나의 duration에 대해 보존할 후보 조합 수.
+# 숫자가 커질수록 계산량은 증가하지만 조합의 질을 더 잘 비교합니다.
 BEAM_WIDTH_PER_DURATION = env_int(
     "BEAM_WIDTH_PER_DURATION",
     4,
 )
 
+# 다운로드한 파일을 playlist 폴더에도 복사할지 여부.
 COPY_TRACKS_TO_PLAYLIST = (
     os.getenv(
         "COPY_TRACKS_TO_PLAYLIST",
@@ -626,12 +630,15 @@ def get_candidate_tracks(
             row["duration"]
         )
 
+        # 이미 실제 영상에서 사용한 곡은 제외.
         if int(row["use_count"] or 0) > 0:
             continue
 
+        # 너무 짧은 곡 제외.
         if duration < MIN_TRACK_DURATION:
             continue
 
+        # 0이면 최대 길이 제한 없음.
         if (
             MAX_TRACK_DURATION > 0
             and duration > MAX_TRACK_DURATION
@@ -785,6 +792,17 @@ def find_best_playlist(
     tracks,
     target_seconds,
 ):
+    """
+    핵심 목적:
+      1. 영상 길이를 넘지 않는다.
+      2. 가능한 한 영상 길이에 가깝게 채운다.
+      3. 같은 길이라면 scoring으로 품질을 비교한다.
+      4. 너무 짧은 곡은 candidate 단계에서 제거한다.
+
+    각 duration마다 여러 후보 상태를 보존하는 beam-search 방식의
+    0/1 knapsack입니다.
+    """
+
     valid = [
         row
         for row in tracks
@@ -795,6 +813,8 @@ def find_best_playlist(
     if not valid:
         return []
 
+    # 너무 많은 곡을 가지고 DP를 돌리는 것을 방지.
+    # 길이별로 골고루 후보를 유지합니다.
     valid = sorted(
         valid,
         key=lambda row:
@@ -804,6 +824,8 @@ def find_best_playlist(
             ),
     )
 
+    # states[sum] =
+    # [(score, (candidate_index, ...)), ...]
     states = {
         0: [
             (
@@ -870,6 +892,7 @@ def find_best_playlist(
                     )
                 )
 
+            # 중복/열등 상태 제거.
             destination.sort(
                 key=lambda x: x[0],
                 reverse=True,
@@ -899,6 +922,8 @@ def find_best_playlist(
     if not states:
         return []
 
+    # 1순위: 총 재생시간.
+    # 2순위: scoring.
     best_sum = max(
         states.keys()
     )
@@ -915,6 +940,8 @@ def find_best_playlist(
         for i in indexes
     ]
 
+    # 최종적으로 랜덤성을 조금 주되,
+    # 같은 artist가 연속으로 붙는 것을 피합니다.
     selected = arrange_tracks(
         selected
     )
@@ -1234,8 +1261,26 @@ def import_legacy_used_file():
 
 
 # ============================================================
-# DOWNLOAD API (오리지널 깃허브 코드 방식 복원)
+# DOWNLOAD API
 # ============================================================
+
+def prepare_headers(headers):
+    blocked = {
+        "host",
+        "content-length",
+        "connection",
+        "accept-encoding",
+        "transfer-encoding",
+        "cookie",
+    }
+
+    return {
+        key: value
+        for key, value in headers.items()
+        if not key.startswith(":")
+        and key.lower() not in blocked
+    }
+
 
 class GetTracksCapture:
 
@@ -1272,9 +1317,12 @@ class GetTracksCapture:
         ):
             return
 
-        headers = dict(
-            request.headers
-        )
+        try:
+            headers = (
+                await request.all_headers()
+            )
+        except Exception:
+            return
 
         self.request = {
             "url": request.url,
@@ -1306,24 +1354,18 @@ async def get_download_url(
         "includeDownloadUrl": True
     }
 
-    headers = dict(
-        captured["headers"]
-    )
-
-    headers.pop(
-        "content-length",
-        None,
-    )
-
     response = await client.post(
         captured["url"],
-        headers=headers,
-        json=payload,
+        headers=prepare_headers(
+            captured["headers"]
+        ),
+        data=json.dumps(payload),
+        timeout=30,
     )
 
     response.raise_for_status()
 
-    data = response.json()
+    data = await response.json()
 
     tracks = (
         data.get("tracks")
@@ -1469,7 +1511,7 @@ async def ensure_downloaded(
         )
 
     print(
-        f"⬇ "
+        f"⬇️ "
         f"{item['artist']} - "
         f"{item['title']}"
     )

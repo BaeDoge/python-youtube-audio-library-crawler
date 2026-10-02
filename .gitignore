@@ -1,3 +1,10 @@
-downloads/*
-tracks.db
 uv.lock
+.env
+tracks.db
+
+downloads/
+playlists/
+playlist_drafts/
+
+__pycache__/
+*.pyc
