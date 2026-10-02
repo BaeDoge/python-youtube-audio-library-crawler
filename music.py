@@ -1237,6 +1237,24 @@ def import_legacy_used_file():
 # DOWNLOAD API (오리지널 깃허브 코드 방식 복원)
 # ============================================================
 
+def prepare_headers(headers):
+    blocked = {
+        "host",
+        "content-length",
+        "connection",
+        "accept-encoding",
+        "transfer-encoding",
+        "cookie",
+    }
+
+    return {
+        key: value
+        for key, value in headers.items()
+        if not key.startswith(":")
+        and key.lower() not in blocked
+    }
+
+
 class GetTracksCapture:
 
     def __init__(self):
@@ -1272,9 +1290,13 @@ class GetTracksCapture:
         ):
             return
 
-        headers = dict(
-            request.headers
-        )
+        try:
+            headers = await request.all_headers()
+        except Exception as exc:
+            print(
+                f"⚠️ 요청 헤더 캡처 실패: {exc}"
+            )
+            return
 
         self.request = {
             "url": request.url,
@@ -1306,24 +1328,43 @@ async def get_download_url(
         "includeDownloadUrl": True
     }
 
-    headers = dict(
-        captured["headers"]
+    api_client = captured.get(
+        "api_request"
     )
 
-    headers.pop(
-        "content-length",
-        None,
-    )
+    if api_client is None:
+        raise RuntimeError(
+            "브라우저 인증 세션을 공유하는 "
+            "API client가 없습니다."
+        )
 
-    response = await client.post(
+    response = await api_client.post(
         captured["url"],
-        headers=headers,
-        json=payload,
+        headers=prepare_headers(
+            captured["headers"]
+        ),
+        data=json.dumps(payload),
+        timeout=30_000,
     )
 
-    response.raise_for_status()
+    if not response.ok:
+        print(
+            f"❌ get_tracks 실패: HTTP {response.status}"
+        )
 
-    data = response.json()
+        try:
+            print(
+                (await response.text())[:1000]
+            )
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            f"get_tracks HTTP {response.status}: "
+            f"{await response.text()}"
+        )
+
+    data = await response.json()
 
     tracks = (
         data.get("tracks")
@@ -1342,7 +1383,7 @@ async def get_download_url(
 
     if not url:
         raise RuntimeError(
-            "downloadAudioUrl이 없습니다."
+            "downloadAudioUrl이 응답에 없습니다."
         )
 
     return url
@@ -2607,6 +2648,11 @@ async def main():
                 "5분 내 get_tracks 요청을 "
                 "캡처하지 못했습니다."
             )
+
+        # get_tracks 재호출은 httpx가 아니라
+        # 현재 Chrome BrowserContext와 인증 세션을 공유하는
+        # Playwright APIRequestContext를 사용해야 합니다.
+        capture.request["api_request"] = context.request
 
         async with httpx.AsyncClient(
             follow_redirects=True,
