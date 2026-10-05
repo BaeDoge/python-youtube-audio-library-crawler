@@ -1881,6 +1881,8 @@ def save_draft(
     video_title,
     playlist_dir,
     integrated_file,
+    genre=None,
+    mood=None,
 ):
     DRAFT_DIR.mkdir(
         parents=True,
@@ -1900,6 +1902,8 @@ def save_draft(
             datetime.now().isoformat(
                 timespec="seconds"
             ),
+        "genre": genre,
+        "mood": mood,
         "items": items,
     }
 
@@ -1933,6 +1937,456 @@ def load_latest_draft():
         path.read_text(
             encoding="utf-8"
         )
+    )
+
+
+def renumber_playlist_items(items):
+    current = 0
+
+    for position, item in enumerate(
+        items,
+        1,
+    ):
+        item["position"] = position
+        item["start_seconds"] = current
+        item["timestamp"] = format_time(
+            current
+        )
+
+        current += int(
+            item["duration"]
+        )
+
+    return items
+
+
+def refresh_draft_files(draft):
+    playlist_dir = Path(
+        draft["playlist_dir"]
+    )
+
+    items = draft["items"]
+
+    tracks_dir = (
+        playlist_dir
+        / "tracks"
+    )
+
+    # OneDrive 환경에서는 tracks 폴더 또는 내부 파일이 동기화/미리보기
+    # 등의 이유로 잠겨 있어 shutil.rmtree()가 WinError 5를 발생시킬 수 있습니다.
+    # 폴더 자체는 유지하고, 삭제 가능한 기존 파일만 정리한 뒤 남은 곡을 다시 복사합니다.
+    tracks_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    expected_names = set()
+
+    if COPY_TRACKS_TO_PLAYLIST:
+        for index, item in enumerate(items, 1):
+            source = Path(item["file_path"])
+            if source.exists():
+                expected_names.add(
+                    f"{index:02d} - {source.name}"
+                )
+
+    for existing in tracks_dir.iterdir():
+        if existing.is_file() and existing.name not in expected_names:
+            try:
+                existing.unlink()
+            except PermissionError:
+                print(
+                    f"⚠️ 잠긴 파일은 삭제하지 않고 유지합니다: {existing.name}"
+                )
+
+    copy_playlist_tracks(
+        items,
+        playlist_dir,
+    )
+
+    integrated_path = (
+        playlist_dir
+        / "background_music.mp3"
+    )
+
+    integrated_file = merge_with_ffmpeg(
+        items,
+        integrated_path,
+    )
+
+    draft["integrated_file"] = (
+        str(integrated_file)
+        if integrated_file
+        else None
+    )
+
+    write_description(
+        playlist_dir,
+        items,
+    )
+
+    write_manifest(
+        playlist_dir,
+        items,
+        int(draft["video_duration"]),
+        draft.get("video_title") or "",
+        integrated_file,
+    )
+
+    DRAFT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    latest_path = (
+        DRAFT_DIR
+        / "latest.json"
+    )
+
+    latest_path.write_text(
+        json.dumps(
+            draft,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    return latest_path
+
+
+async def remove_tracks_from_last_draft(
+    client,
+    captured,
+):
+    draft = load_latest_draft()
+
+    if not draft:
+        print(
+            "\n제거할 마지막 플레이리스트 draft가 없습니다."
+        )
+        return
+
+    items = draft.get("items") or []
+
+    if not items:
+        print(
+            "\n현재 플레이리스트에 곡이 없습니다."
+        )
+        return
+
+    print()
+    print("=" * 80)
+    print("🎧 마지막 플레이리스트에서 곡 제거")
+    print("=" * 80)
+
+    for item in items:
+        print(
+            f"{item['position']:2}. "
+            f"{item['timestamp']}  "
+            f"{item['artist']} - "
+            f"{item['title']}"
+        )
+
+    print()
+    value = input(
+        "제거할 곡 번호 (예: 3,7,10 / q: 취소): "
+    ).strip()
+
+    if value.lower() == "q":
+        print("❌ 제거 취소")
+        return
+
+    try:
+        positions = sorted({
+            int(part.strip())
+            for part in value.split(",")
+            if part.strip()
+        })
+    except ValueError:
+        print(
+            "❌ 곡 번호는 쉼표로 구분된 숫자로 입력하세요. "
+            "예: 3,7,10"
+        )
+        return
+
+    if not positions:
+        print("❌ 제거할 곡이 없습니다.")
+        return
+
+    invalid = [
+        position
+        for position in positions
+        if position < 1
+        or position > len(items)
+    ]
+
+    if invalid:
+        print(
+            "❌ 존재하지 않는 곡 번호: "
+            + ", ".join(
+                map(str, invalid)
+            )
+        )
+        return
+
+    removed = [
+        item
+        for item in items
+        if item["position"] in positions
+    ]
+
+    remaining = [
+        item
+        for item in items
+        if item["position"] not in positions
+    ]
+
+    if not remaining:
+        print(
+            "\n⚠️ 모든 곡을 제거할 수는 없습니다. "
+            "최소 1곡은 남겨주세요."
+        )
+        return
+
+    removed_seconds = sum(
+        int(item["duration"])
+        for item in removed
+    )
+
+    print()
+    print("제거할 곡:")
+
+    for item in removed:
+        print(
+            f"  ❌ {item['artist']} - "
+            f"{item['title']} "
+            f"[{format_time(int(item['duration']))}]"
+        )
+
+    print(
+        f"\n빈자리: {format_time(removed_seconds)}"
+    )
+
+    # --------------------------------------------------------
+    # 처음 선택했던 장르 / Mood를 유지합니다.
+    # 이전 draft에 이 정보가 없으면 첫 곡의 값을 fallback으로 사용합니다.
+    # --------------------------------------------------------
+    genre = draft.get("genre")
+    mood = draft.get("mood")
+
+    if genre is None and items:
+        genre = items[0].get("genre")
+
+    if mood is None and items:
+        mood = items[0].get("mood")
+
+    # 현재 플레이리스트에 이미 들어있는 곡은 대체 후보에서 제외합니다.
+    existing_track_ids = {
+        item["track_id"]
+        for item in items
+    }
+
+    candidates = get_candidate_tracks(
+        genre,
+        mood,
+    )
+
+    candidates = [
+        row
+        for row in candidates
+        if row["track_id"] not in existing_track_ids
+    ]
+
+    replacements = find_best_playlist(
+        candidates,
+        removed_seconds,
+    )
+
+    if not replacements:
+        print(
+            "\n⚠️ 같은 장르 / Mood에서 빈자리를 채울 "
+            "미사용 곡을 찾지 못했습니다."
+        )
+        print(
+            "제거 작업을 취소하고 기존 플레이리스트를 유지합니다."
+        )
+        return
+
+    replacement_items = build_playlist_items(
+        replacements
+    )
+
+    print()
+    print("대체할 곡:")
+    replacement_seconds = sum(
+        int(item["duration"])
+        for item in replacement_items
+    )
+
+    for item in replacement_items:
+        print(
+            f"  ➕ {item['artist']} - "
+            f"{item['title']} "
+            f"[{format_time(int(item['duration']))}]"
+        )
+
+    print(
+        f"대체 음악 길이: {format_time(replacement_seconds)} "
+        f"/ 빈자리: {format_time(removed_seconds)}"
+    )
+    print(
+        f"남는 시간: {format_time(removed_seconds - replacement_seconds)}"
+    )
+
+    # 대체곡을 실제로 다운로드합니다.
+    print()
+    print("=" * 80)
+    print("⬇️ 대체 음악 다운로드")
+    print("=" * 80)
+
+    for index, item in enumerate(
+        replacement_items,
+        1,
+    ):
+        print(
+            f"\n[{index}/{len(replacement_items)}]"
+        )
+
+        await ensure_downloaded(
+            client,
+            captured,
+            item,
+        )
+
+        await asyncio.sleep(
+            random.uniform(0.3, 0.8)
+        )
+
+    # 제거한 곡은 다시 추천되지 않도록 used.txt에 기록하고
+    # DB의 사용 이력에도 반영합니다.
+    existing_used = set()
+
+    if USED_FILE.exists():
+        existing_used = {
+            normalize_text(line).casefold()
+            for line in USED_FILE.read_text(
+                encoding="utf-8-sig"
+            ).splitlines()
+            if normalize_text(line)
+            and not normalize_text(line).startswith("#")
+        }
+
+    used_to_add = []
+
+    for item in removed:
+        used_entry = (
+            f"{item['artist']} - {item['title']}"
+        )
+
+        if used_entry.casefold() not in existing_used:
+            used_to_add.append(used_entry)
+            existing_used.add(used_entry.casefold())
+
+    if used_to_add:
+        USED_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with USED_FILE.open(
+            "a",
+            encoding="utf-8",
+            newline=""
+        ) as file:
+            for entry in used_to_add:
+                file.write(entry + "\n")
+
+    conn = db()
+    now = datetime.now().isoformat(
+        timespec="seconds"
+    )
+
+    for item in removed:
+        conn.execute("""
+            INSERT INTO track_usage (
+                track_id,
+                use_count,
+                first_used_at,
+                last_used_at
+            )
+            VALUES (?, 1, ?, ?)
+
+            ON CONFLICT(track_id)
+            DO UPDATE SET
+                use_count =
+                    CASE
+                        WHEN track_usage.use_count = 0
+                        THEN 1
+                        ELSE track_usage.use_count
+                    END,
+                first_used_at =
+                    COALESCE(
+                        track_usage.first_used_at,
+                        excluded.first_used_at
+                    ),
+                last_used_at =
+                    excluded.last_used_at
+        """, (
+            item["track_id"],
+            now,
+            now,
+        ))
+
+    conn.commit()
+    conn.close()
+
+    # 기존 곡 + 대체곡을 하나의 플레이리스트로 구성합니다.
+    remaining.extend(
+        replacement_items
+    )
+
+    renumber_playlist_items(
+        remaining
+    )
+
+    draft["genre"] = genre
+    draft["mood"] = mood
+    draft["items"] = remaining
+
+    refresh_draft_files(
+        draft
+    )
+
+    print()
+    print("=" * 80)
+    print("✅ 플레이리스트 수정 완료")
+    print("=" * 80)
+    print(
+        f"제거: {len(removed)}곡 / "
+        f"{format_time(removed_seconds)}"
+    )
+    print(
+        f"대체: {len(replacement_items)}곡 / "
+        f"{format_time(replacement_seconds)}"
+    )
+    print(
+        f"남는 음악 시간: "
+        f"{format_time(removed_seconds - replacement_seconds)}"
+    )
+    print(
+        f"전체 음악 길이: "
+        f"{format_time(sum(int(item['duration']) for item in remaining))}"
+    )
+    print(
+        f"통합 MP3: {draft.get('integrated_file') or '생성되지 않음'}"
+    )
+    print(
+        f"Draft: {DRAFT_DIR / 'latest.json'}"
+    )
+    print(
+        "\n※ 제거한 곡은 다운로드 폴더에서 삭제하지 않습니다. "
+        "used.txt 및 사용 이력에 기록되어 다음 플레이리스트에서는 제외됩니다."
     )
 
 
@@ -2480,6 +2934,8 @@ async def create_playlist(
         video_title,
         playlist_dir,
         integrated_file,
+        genre,
+        mood,
     )
 
     # --------------------------------------------------------
@@ -2703,6 +3159,10 @@ async def main():
                 )
 
                 print(
+                    "8. 마지막 플레이리스트에서 싫은 곡 제거"
+                )
+
+                print(
                     "0. 종료"
                 )
 
@@ -2740,6 +3200,13 @@ async def main():
                 elif choice == "7":
 
                     import_legacy_used_file()
+
+                elif choice == "8":
+
+                    await remove_tracks_from_last_draft(
+                        client,
+                        capture.request,
+                    )
 
                 elif choice == "0":
 

@@ -5,6 +5,7 @@ tracks.db
 downloads/
 playlists/
 playlist_drafts/
+backup/
 
 __pycache__/
 *.pyc
