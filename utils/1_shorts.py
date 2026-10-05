@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""
-now Playing Korea - Shorts 9:16 Clip Generator
-
-- Source videos are read from SHORTS_SOURCE_DIR.
-- Default: C:\\Users\\qold0\\AppData\\Local\\CapCut\\Videos
-- Select a source video.
-- Enter a title for the output folder.
-- Repeatedly enter start time + duration.
-- Each segment is center-cropped to 9:16 and exported as 1080x1920.
-- No music is added.
-- Requires ffmpeg and ffprobe on PATH.
-"""
+"""now Playing Korea - Shorts 9:16 Clip Generator"""
 
 import os
 import re
@@ -18,10 +7,40 @@ import shutil
 import subprocess
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    print("❌ python-dotenv가 설치되어 있지 않습니다.")
+    print("설치: pip install python-dotenv")
+    raise SystemExit(1)
+
+# .env 위치: utils/.env 또는 프로젝트 루트/.env 모두 지원
+SCRIPT_DIR = Path(__file__).resolve().parent
+load_dotenv(SCRIPT_DIR / ".env", override=False)
+load_dotenv(SCRIPT_DIR.parent / ".env", override=False)
+
 DEFAULT_SOURCE_DIR = Path(r"C:\Users\qold0\AppData\Local\CapCut\Videos")
 SOURCE_DIR = Path(os.getenv("SHORTS_SOURCE_DIR", str(DEFAULT_SOURCE_DIR)))
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+
+
+def decode_output(data: bytes) -> str:
+    """Windows cp949 문제를 피하기 위해 subprocess 결과를 직접 UTF-8로 디코딩."""
+    if not data:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def run_command(args):
+    # 중요: text=True를 사용하지 않는다.
+    # Windows 기본 인코딩(cp949)으로 ffmpeg UTF-8 출력이 디코딩되는 문제를 방지한다.
+    return subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
 
 
 def check_command(command: str):
@@ -29,10 +48,6 @@ def check_command(command: str):
         print(f"❌ '{command}'을(를) 찾을 수 없습니다.")
         print("ffmpeg를 설치하고 PATH에 추가한 뒤 다시 실행해주세요.")
         raise SystemExit(1)
-
-
-def run_command(args):
-    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
 def parse_time(value: str) -> float:
@@ -79,9 +94,13 @@ def get_duration(video: Path) -> float:
     ])
 
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
+        error = decode_output(result.stderr).strip()
+        raise RuntimeError(error or "ffprobe 실행 실패")
 
-    return float(result.stdout.strip())
+    try:
+        return float(decode_output(result.stdout).strip())
+    except ValueError as exc:
+        raise RuntimeError("ffprobe가 올바른 영상 길이를 반환하지 않았습니다.") from exc
 
 
 def list_videos():
@@ -94,13 +113,10 @@ def list_videos():
         p for p in SOURCE_DIR.iterdir()
         if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
     ]
-
     return sorted(videos, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def create_vertical_clip(source: Path, output: Path, start: float, duration: float):
-    # Scale so the frame covers 1080x1920, then crop the exact center.
-    # For a normal 16:9 source this effectively takes the center 9:16 area.
     vf = (
         "scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920:(iw-1080)/2:(ih-1920)/2,"
@@ -125,7 +141,8 @@ def create_vertical_clip(source: Path, output: Path, start: float, duration: flo
 
     if result.returncode != 0:
         print("❌ ffmpeg 오류:")
-        print(result.stderr)
+        error = decode_output(result.stderr).strip()
+        print(error if error else "(ffmpeg stderr가 비어 있습니다.)")
         return False
 
     return True
@@ -136,7 +153,6 @@ def main():
     check_command("ffprobe")
 
     videos = list_videos()
-
     if not videos:
         print(f"❌ 영상 파일이 없습니다: {SOURCE_DIR}")
         return
@@ -153,16 +169,13 @@ def main():
             duration_text = f"{duration / 60:.1f}분"
         except Exception:
             duration_text = "길이 확인 실패"
-
         print(f"[{i:2}] {video.name} ({duration_text})")
 
     print()
     while True:
         choice = input("사용할 영상 번호를 선택하세요 (q: 종료): ").strip()
-
         if choice.lower() == "q":
             return
-
         try:
             index = int(choice) - 1
             if not 0 <= index < len(videos):
@@ -178,14 +191,8 @@ def main():
         print(f"❌ 영상 길이를 확인할 수 없습니다: {e}")
         return
 
-    title = input(
-        f"\n영상 제목을 입력하세요 (Enter = {source.stem}): "
-    ).strip()
-
-    if not title:
-        title = source.stem
-
-    title = sanitize_filename(title)
+    title = input(f"\n영상 제목을 입력하세요 (Enter = {source.stem}): ").strip()
+    title = sanitize_filename(title or source.stem)
 
     shorts_root = SOURCE_DIR.parent / "Shorts"
     output_dir = shorts_root / title
@@ -200,19 +207,16 @@ def main():
 
     next_number = 1
     existing = list(output_dir.glob("*.mp4"))
-
-    if existing:
-        numbers = []
-        for file in existing:
-            match = re.match(r"(\d+)_", file.name)
-            if match:
-                numbers.append(int(match.group(1)))
-        if numbers:
-            next_number = max(numbers) + 1
+    numbers = []
+    for file in existing:
+        match = re.match(r"(\d+)_", file.name)
+        if match:
+            numbers.append(int(match.group(1)))
+    if numbers:
+        next_number = max(numbers) + 1
 
     while True:
         start_input = input("시작 시간 (q: 종료): ").strip()
-
         if start_input.lower() == "q":
             break
 
@@ -227,7 +231,6 @@ def main():
             continue
 
         duration_input = input("길이 (Enter = 30초): ").strip()
-
         if not duration_input:
             duration = 30.0
         else:
@@ -242,7 +245,6 @@ def main():
             continue
 
         actual_duration = min(duration, source_duration - start)
-
         output_name = (
             f"{next_number:02d}_"
             f"{format_time(start)}_to_{format_time(start + actual_duration)}.mp4"
@@ -250,13 +252,11 @@ def main():
         output = output_dir / output_name
 
         print(f"🎬 생성 중: {output.name}")
-
         if create_vertical_clip(source, output, start, actual_duration):
             print(f"✅ 완료: {output}")
             next_number += 1
         else:
             print("❌ 생성 실패")
-
         print()
 
 
