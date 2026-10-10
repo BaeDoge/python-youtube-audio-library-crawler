@@ -1469,29 +1469,52 @@ def _probe_audio_duration_seconds(path: Path):
         return None
 
 
+def _mark_external_track_ineligible(track_id, reason="invalid audio file"):
+    """Persistently blacklist a broken Openverse URL, including across catalog refreshes."""
+    conn = db()
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(tracks)")}
+    if "external_validation_failed" not in columns:
+        conn.execute("ALTER TABLE tracks ADD COLUMN external_validation_failed INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        "UPDATE tracks SET external_eligible=0, external_validation_failed=1 "
+        "WHERE track_id=? AND external_source='openverse'",
+        (track_id,),
+    )
+    conn.commit()
+    conn.close()
+    print(f"⚠️ Openverse 후보에서 영구 제외: {track_id} ({reason})")
+
+
 def _validate_external_audio(path: Path, source: str, expected_duration: int = 0):
-    """Reject Openverse preview/snippet URLs that are much shorter than catalog metadata."""
+    """Reject Openverse previews, error pages, and duration-inconsistent files.
+
+    expected_duration is normalized to seconds in the database; Openverse's raw
+    API duration is milliseconds and is converted in external_music.py.
+    """
     if source != "openverse":
         return
 
     actual_duration = _probe_audio_duration_seconds(path)
-    # Small audio samples and preview clips are not useful as background music.
+    file_size = path.stat().st_size if path.exists() else 0
     too_short = actual_duration is not None and actual_duration < 10
+    # Openverse's API duration can be wrong, but accepting a large mismatch makes
+    # generated timestamps and target playlist length misleading. Allow 15% drift.
     duration_mismatch = (
         actual_duration is not None and expected_duration > 0
-        and actual_duration < max(10, expected_duration * 0.5)
+        and abs(actual_duration - expected_duration) > max(8, expected_duration * 0.15)
     )
-    suspiciously_small = path.stat().st_size < 32 * 1024
-    if too_short or duration_mismatch or suspiciously_small:
+    suspiciously_small = file_size < 32 * 1024
+    if actual_duration is None or too_short or duration_mismatch or suspiciously_small:
         details = (
             f"실제 길이 {actual_duration:.2f}초" if actual_duration is not None
-            else f"파일 크기 {path.stat().st_size:,} bytes"
+            else "ffprobe로 오디오 길이를 확인할 수 없음"
         )
+        details += f", 파일 크기 {file_size:,} bytes"
         if expected_duration > 0:
             details += f", Openverse 메타데이터 길이 {expected_duration}초"
         raise RuntimeError(
-            f"Openverse 음원이 미리듣기/일부 데이터일 수 있어 제외했습니다: {path.name} ({details}). "
-            "이 트랙은 다운로드 후보에서 제외하고 다른 곡을 선택하세요."
+            f"Openverse 음원이 미리듣기/일부 데이터이거나 메타데이터 길이와 맞지 않아 제외했습니다: "
+            f"{path.name} ({details})."
         )
 
 
@@ -1594,12 +1617,14 @@ async def ensure_downloaded(
         try:
             _validate_external_audio(existing, external_source or "", expected_duration)
         except RuntimeError as exc:
-            print(f"⚠️ 기존 다운로드 파일이 비정상이라 다시 받습니다: {exc}")
+            print(f"⚠️ 기존 다운로드 파일이 비정상입니다: {exc}")
             try:
                 existing.unlink(missing_ok=True)
             except OSError:
                 pass
             _remove_download_history(item["track_id"])
+            _mark_external_track_ineligible(item["track_id"], str(exc))
+            raise
         else:
             item["file_path"] = str(existing)
             return existing
@@ -1660,19 +1685,17 @@ async def ensure_downloaded(
             f"[{item['track_id']}].mp3"
         )
 
-    await download_file(
-        client,
-        url,
-        path,
-    )
-
     try:
+        await download_file(client, url, path)
         _validate_external_audio(path, external_source or "", expected_duration)
-    except RuntimeError:
+    except Exception as exc:
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+        if external_source == "openverse":
+            _remove_download_history(item["track_id"])
+            _mark_external_track_ineligible(item["track_id"], str(exc))
         raise
 
     save_download_history(
@@ -1718,11 +1741,13 @@ def copy_playlist_tracks(
         items,
         1,
     ):
-        source = Path(
-            item["file_path"]
-        )
+        file_path = item.get("file_path")
+        if not file_path:
+            continue
 
-        if not source.exists():
+        source = Path(file_path)
+
+        if not source.is_file():
             continue
 
         destination = (
@@ -3030,11 +3055,28 @@ async def create_playlist(
             *(download_one(index, item) for index, item in enumerate(items, 1)),
             return_exceptions=True,
         )
-        failures = [result for result in results if isinstance(result, Exception)]
+        failures = [(items[index], result) for index, result in enumerate(results) if isinstance(result, Exception)]
         if failures:
-            for error in failures:
-                print(f"❌ 외부 음원 다운로드 실패: {error}")
-            print("다운로드 실패가 있어 합본 생성을 중단했습니다. 다시 시도할 수 있습니다.")
+            # Keep successful downloads visible in this playlist's package even if
+            # another track fails. Previously this early return skipped copying
+            # every successful file into playlist_dir/tracks.
+            copy_playlist_tracks(items, playlist_dir)
+            error_lines = [
+                "일부 음원 다운로드에 실패하여 합본 MP3는 생성하지 않았습니다.",
+                "성공한 음원은 tracks 폴더에 복사했습니다.",
+                "",
+            ]
+            for failed_item, error in failures:
+                message = f"{failed_item.get('artist', 'Unknown')} - {failed_item.get('title', 'Unknown')}: {error}"
+                print(f"❌ 외부 음원 다운로드 실패: {message}")
+                error_lines.append(message)
+            error_path = playlist_dir / "download_errors.txt"
+            error_path.write_text("\n".join(error_lines) + "\n", encoding="utf-8")
+            successful_count = sum(1 for item in items if item.get("file_path") and Path(item["file_path"]).is_file())
+            print(f"\n⚠️ 다운로드 성공: {successful_count}/{len(items)}곡")
+            print(f"성공한 개별 음원 폴더: {playlist_dir / 'tracks'}")
+            print(f"실패 기록: {error_path}")
+            print("합본 MP3는 생성하지 않았습니다. 실패한 곡을 제외하거나 다시 시도하세요.")
             return
     else:
         for index, item in enumerate(items, 1):

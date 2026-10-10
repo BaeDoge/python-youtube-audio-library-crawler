@@ -84,6 +84,7 @@ def _ensure_columns(conn):
         "external_source_url": "TEXT",
         "local_file_path": "TEXT",
         "external_eligible": "INTEGER NOT NULL DEFAULT 1",
+        "external_validation_failed": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, definition in additions.items():
         if name not in existing:
@@ -314,53 +315,132 @@ async def update_jamendo_catalog(client_id: str, limit: int = 2000) -> tuple[int
     return len(catalog), eligible_count
 
 
-async def update_openverse_catalog(limit: int = 1000, query: str = "instrumental music") -> tuple[int, int]:
-    """Collect openly licensed audio metadata from Openverse.
+def _openverse_tags(item: dict) -> list[str]:
+    tags = item.get("tags") or []
+    if isinstance(tags, str):
+        return [tags]
+    if isinstance(tags, list):
+        return [str(tag.get("name") if isinstance(tag, dict) else tag) for tag in tags if tag]
+    return []
 
-    Only CC0/CC BY tracks with a direct URL and positive duration are inserted
-    as playlist candidates. Metadata records remain in the JSON catalog even
-    when their duration/download URL is unavailable.
+
+def _classify_openverse(item: dict) -> tuple[list[str], list[str]]:
+    """Openverse tags are not reliably genre/mood labels; classify conservatively."""
+    tags = _openverse_tags(item)
+    text = " ".join([
+        str(item.get("title") or ""),
+        str(item.get("creator") or ""),
+        " ".join(tags),
+    ]).lower().replace("_", " ")
+    def has_term(term: str) -> bool:
+        # Word boundaries avoid false matches such as "upbeat" being classified as "beat"/Hip-hop.
+        pattern = r"(?<!\w)" + re.escape(term.lower()) + r"(?!\w)"
+        return re.search(pattern, text) is not None
+
+    genre_rules = [
+        ("Jazz", ("jazz", "bebop", "swing", "bossa nova")),
+        ("Lo-fi", ("lofi", "lo-fi", "lo fi", "chillhop")),
+        ("Classical", ("classical", "orchestra", "orchestral", "symphony", "baroque")),
+        ("Ambient", ("ambient", "drone", "soundscape")),
+        ("Piano", ("piano", "keyboard")),
+        ("Acoustic", ("acoustic", "fingerstyle", "ukulele")),
+        ("Guitar", ("guitar", "riff")),
+        ("Electronic", ("electronic", "synth", "synthwave", "techno", "house", "edm")),
+        ("Cinematic", ("cinematic", "film score", "epic", "trailer")),
+        ("Blues", ("blues",)),
+        ("Funk", ("funk", "groove")),
+        ("Rock", ("rock", "metal", "punk")),
+        ("Hip-hop", ("hip hop", "hip-hop", "rap", "beat")),
+        ("Reggae", ("reggae", "ska")),
+        ("Folk", ("folk", "country", "bluegrass")),
+        ("Pop", ("pop",)),
+        ("World", ("world music", "african", "latin", "indian music")),
+    ]
+    genres = [label for label, words in genre_rules if any(has_term(word) for word in words)]
+    if not genres:
+        genres = ["Other"]
+
+    mood_rules = [
+        ("Calm", ("calm", "relax", "peaceful", "soft", "meditation", "ambient", "sleep")),
+        ("Upbeat", ("upbeat", "happy", "energetic", "fun", "funky", "dance")),
+        ("Moody", ("dark", "sad", "melancholy", "dramatic", "mysterious")),
+        ("Focus", ("study", "focus", "work", "concentration")),
+        ("Cinematic", ("cinematic", "epic", "orchestral", "soundtrack")),
+    ]
+    moods = [label for label, words in mood_rules if any(has_term(word) for word in words)]
+    if not moods:
+        moods = ["Neutral"]
+    return genres, moods
+
+
+async def update_openverse_catalog(limit: int = 1000, query: str = "instrumental music") -> tuple[int, int]:
+    """Collect diverse Openverse audio results, paginating each query and deduplicating IDs.
+
+    A blank/default query fans out across genre-specific searches. Metadata duration
+    is only a preliminary estimate; the downloader validates the real audio file.
     """
     if not DB_PATH.exists():
         raise FileNotFoundError(f"DB not found: {DB_PATH}. Run collect.py first.")
     total_limit = max(1, min(int(limit), 5000))
-    page_size = 20
     endpoint = "https://api.openverse.org/v1/audio/"
+    default_queries = [
+        "instrumental music", "ambient instrumental", "jazz instrumental",
+        "piano instrumental", "acoustic guitar instrumental", "lofi instrumental",
+        "classical instrumental", "cinematic instrumental", "electronic instrumental",
+        "blues instrumental", "funk instrumental", "rock instrumental",
+        "chill instrumental", "folk instrumental", "upbeat background music",
+    ]
+    requested = (query or "").strip()
+    if not requested or requested.lower() in {"instrumental music", "all", "전체"}:
+        queries = default_queries
+    elif ";" in requested:
+        queries = [part.strip() for part in requested.split(";") if part.strip()]
+    else:
+        queries = [requested]
+    queries = list(dict.fromkeys(queries))
+    per_query_target = max(1, (total_limit + len(queries) - 1) // len(queries))
     fetched: list[dict] = []
     seen: set[str] = set()
     async with httpx.AsyncClient(timeout=45, follow_redirects=True, headers={"User-Agent": "MusicManager/1.0 (open-license audio catalog)"}) as client:
-        page = 1
-        while len(fetched) < total_limit:
-            params = {
-                "q": query.strip() or "instrumental music",
-                "license": "cc0,by", "license_type": "commercial",
-                "page": page, "page_size": min(page_size, total_limit - len(fetched)),
-                "filter_dead": "true", "mature": "false",
-            }
-            response = await client.get(endpoint, params=params)
-            if response.status_code == 429:
-                raise RuntimeError("Openverse API rate limit(429)에 도달했습니다. 잠시 후 다시 시도하세요.")
-            response.raise_for_status()
-            payload = response.json()
-            results = payload.get("results") or []
-            if not results:
+        for query_index, search_query in enumerate(queries, 1):
+            if len(fetched) >= total_limit:
                 break
-            new_count = 0
-            for item in results:
-                identifier = str(item.get("id") or item.get("foreign_landing_url") or item.get("url") or "")
-                if not identifier or identifier in seen:
-                    continue
-                seen.add(identifier)
-                fetched.append(item)
-                new_count += 1
-                if len(fetched) >= total_limit:
+            query_target = min(per_query_target, total_limit - len(fetched))
+            query_count = 0
+            page = 1
+            while query_count < query_target and len(fetched) < total_limit:
+                page_size = min(20, query_target - query_count, total_limit - len(fetched))
+                params = {
+                    "q": search_query,
+                    "license": "cc0,by", "license_type": "commercial",
+                    "page": page, "page_size": page_size,
+                    "filter_dead": "true", "mature": "false",
+                }
+                response = await client.get(endpoint, params=params)
+                if response.status_code == 429:
+                    raise RuntimeError("Openverse API rate limit(429)에 도달했습니다. 잠시 후 다시 시도하세요.")
+                response.raise_for_status()
+                payload = response.json()
+                results = payload.get("results") or []
+                if not results:
                     break
-            print(f"Openverse 수집 진행: {len(fetched):,}/{total_limit:,}곡 (page={page})")
-            page_count = int(payload.get("page_count") or 0)
-            has_next = bool(payload.get("next")) or (page_count > 0 and page < page_count)
-            if new_count == 0 or not has_next:
-                break
-            page += 1
+                new_count = 0
+                for item in results:
+                    identifier = str(item.get("id") or item.get("foreign_landing_url") or item.get("url") or "")
+                    if not identifier or identifier in seen:
+                        continue
+                    seen.add(identifier)
+                    fetched.append(item)
+                    query_count += 1
+                    new_count += 1
+                    if len(fetched) >= total_limit or query_count >= query_target:
+                        break
+                print(f"Openverse 검색 {query_index}/{len(queries)} [{search_query}]: 전체 {len(fetched):,}/{total_limit:,}곡 (page={page})")
+                page_count = int(payload.get("page_count") or 0)
+                has_next = bool(payload.get("next")) or (page_count > 0 and page < page_count)
+                if new_count == 0 or not has_next:
+                    break
+                page += 1
 
     if not fetched:
         raise RuntimeError("Openverse 검색 결과가 0곡입니다. 검색어를 바꾸거나 잠시 후 다시 시도하세요.")
@@ -369,42 +449,45 @@ async def update_openverse_catalog(limit: int = 1000, query: str = "instrumental
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     _ensure_columns(conn)
+    # Older versions mistakenly treated Openverse milliseconds as seconds. Clear
+    # prior validation blacklists and revalidate any selected tracks against their
+    # now-normalized durations when downloaded again.
+    conn.execute("UPDATE tracks SET external_validation_failed=0 WHERE external_source='openverse'")
+    # Deactivate stale Openverse rows from previous searches. Current results are re-enabled below.
+    conn.execute("UPDATE tracks SET external_eligible=0 WHERE external_source='openverse'")
     catalog: list[dict] = []
     eligible_count = 0
     for item in fetched:
         raw_id = str(item.get("id") or hashlib.sha1(str(item.get("url") or item.get("foreign_landing_url") or "").encode()).hexdigest()[:16])
         title = item.get("title") or "Unknown"
         artist = item.get("creator") or "Unknown"
-        duration_value = item.get("duration")
+        # Openverse duration is milliseconds; normalize to seconds for our DB.
         try:
-            duration = int(float(duration_value or 0))
+            duration_ms = int(float(item.get("duration") or 0))
+            duration = max(0, int(round(duration_ms / 1000)))
         except (TypeError, ValueError):
+            duration_ms = 0
             duration = 0
         license_code = str(item.get("license") or "").lower()
         license_url = item.get("license_url") or (f"https://creativecommons.org/licenses/{license_code}/4.0/" if license_code == "by" else "https://creativecommons.org/publicdomain/zero/1.0/" if license_code == "cc0" else "")
         download_url = item.get("url") or ""
         source_url = item.get("foreign_landing_url") or item.get("detail_url") or ""
-        # Be conservative: allow CC0 and CC BY only, and require a usable URL/duration.
         license_ok = license_code in {"cc0", "by"}
-        eligible = license_ok and bool(download_url) and bool(source_url) and duration > 0
-        tags = item.get("tags") or []
-        if isinstance(tags, list):
-            tag_names = [str(tag.get("name") if isinstance(tag, dict) else tag) for tag in tags]
-        else:
-            tag_names = [str(tags)]
-        genres = item.get("genres") or tag_names or ["Other"]
-        if isinstance(genres, str): genres = [genres]
-        moods = ["Calm"]
+        # Positive API duration is not enough to trust an audio candidate; the real
+        # file is checked at download time. Still require the fields to be present.
+        eligible = license_ok and bool(download_url) and bool(source_url) and duration >= 10
+        genres, moods = _classify_openverse(item)
         track_id = f"openverse:{raw_id}"
         catalog.append({
             "track_id": track_id, "title": title, "artist": artist,
-            "duration": duration, "genres": genres, "moods": moods,
+            "duration": duration, "duration_ms": duration_ms, "genres": genres, "moods": moods,
             "license": license_code, "license_url": license_url,
             "license_ok_for_default_filter": license_ok,
             "download_allowed": bool(download_url), "eligible_for_playlist": eligible,
             "source_url": source_url, "download_url": download_url,
             "provider": item.get("provider") or "Openverse",
             "attribution": item.get("attribution") or "",
+            "search_query": next((q for q in queries if q.lower() in (str(item.get("title") or "") + " " + " ".join(_openverse_tags(item))).lower()), queries[0]),
         })
         if not eligible:
             continue
@@ -420,7 +503,8 @@ async def update_openverse_catalog(limit: int = 1000, query: str = "instrumental
                 genres=excluded.genres, moods=excluded.moods, license_type=excluded.license_type,
                 external_source=excluded.external_source, external_download_url=excluded.external_download_url,
                 external_license_url=excluded.external_license_url, external_source_url=excluded.external_source_url,
-                raw_json=excluded.raw_json, collected_at=excluded.collected_at, external_eligible=1
+                raw_json=excluded.raw_json, collected_at=excluded.collected_at,
+                external_eligible=CASE WHEN tracks.external_validation_failed=1 THEN 0 ELSE 1 END
         """, (track_id, title, artist, duration, _safe_json(genres), _safe_json(moods), _safe_json([]),
               license_url, "openverse", download_url, license_url, source_url,
               _safe_json(item), now))
@@ -428,7 +512,7 @@ async def update_openverse_catalog(limit: int = 1000, query: str = "instrumental
     conn.commit()
     conn.close()
     _save_catalog_source("openverse", "Openverse API", catalog, eligible_count, {
-        "requested_limit": total_limit, "query": query.strip() or "instrumental music",
+        "requested_limit": total_limit, "queries": queries,
         "license_filter": "cc0,by", "license_type_filter": "commercial",
     })
     return len(catalog), eligible_count
