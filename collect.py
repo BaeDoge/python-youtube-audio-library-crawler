@@ -5,11 +5,13 @@ from datetime import datetime
 from pathlib import Path
 
 from playwright.async_api import async_playwright
+from project_paths import DB_PATH, migrate_legacy_paths
+
+migrate_legacy_paths()
 
 CDP_URL = "http://127.0.0.1:9222"
 CHANNEL_ID = "UCzLBIavNT7yYjN1sl1cCnrg"
 STUDIO_URL = f"https://studio.youtube.com/channel/{CHANNEL_ID}/music"
-DB_PATH = Path(__file__).resolve().parent / "tracks.db"
 PAGE_SIZE = 30
 
 
@@ -36,9 +38,26 @@ def init_db():
             license_type TEXT,
             external_artist_url TEXT,
             raw_json TEXT,
-            collected_at TEXT
+            collected_at TEXT,
+            external_source TEXT,
+            external_download_url TEXT,
+            external_license_url TEXT,
+            external_source_url TEXT,
+            local_file_path TEXT,
+            external_eligible INTEGER NOT NULL DEFAULT 1
         )
     """)
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(tracks)")}
+    for column, definition in {
+        "external_source": "TEXT",
+        "external_download_url": "TEXT",
+        "external_license_url": "TEXT",
+        "external_source_url": "TEXT",
+        "local_file_path": "TEXT",
+        "external_eligible": "INTEGER NOT NULL DEFAULT 1",
+    }.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE tracks ADD COLUMN {column} {definition}")
     conn.commit()
     conn.close()
 

@@ -14,36 +14,29 @@ import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
+from external_music import scan_local_music, update_jamendo_catalog, update_openverse_catalog
+from project_paths import (
+    BASE_DIR, DB_PATH, DOWNLOAD_DIR, PLAYLIST_DIR, DRAFT_DIR,
+    USED_FILE, CATALOG_PATH, EXTERNAL_MUSIC_DIR, migrate_legacy_paths,
+)
+
 
 # ============================================================
 # PATH / ENV
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-
 load_dotenv(BASE_DIR / ".env")
+migrate_legacy_paths()
 
-DB_PATH = BASE_DIR / "tracks.db"
-
-DOWNLOAD_DIR = BASE_DIR / os.getenv(
-    "DOWNLOAD_DIR",
-    "downloads",
-)
-
-PLAYLIST_DIR = BASE_DIR / os.getenv(
-    "PLAYLIST_DIR",
-    "playlists",
-)
-
-DRAFT_DIR = BASE_DIR / os.getenv(
-    "DRAFT_DIR",
-    "playlist_drafts",
-)
-
-USED_FILE = BASE_DIR / os.getenv(
-    "USED_FILE",
-    "used.txt",
-)
+# Paths may be overridden in .env, but default to the organized output tree.
+_download_setting = os.getenv("DOWNLOAD_DIR", "output/downloads").strip().replace("\\", "/")
+_playlist_setting = os.getenv("PLAYLIST_DIR", "output/playlists").strip().replace("\\", "/")
+_draft_setting = os.getenv("DRAFT_DIR", "output/playlist_drafts").strip().replace("\\", "/")
+_used_setting = os.getenv("USED_FILE", "data/used.txt").strip().replace("\\", "/")
+DOWNLOAD_DIR = BASE_DIR / ("output/downloads" if _download_setting in {"downloads", "download"} else _download_setting)
+PLAYLIST_DIR = BASE_DIR / ("output/playlists" if _playlist_setting in {"playlists", "playlist"} else _playlist_setting)
+DRAFT_DIR = BASE_DIR / ("output/playlist_drafts" if _draft_setting in {"playlist_drafts", "playlist_draft"} else _draft_setting)
+USED_FILE = BASE_DIR / ("data/used.txt" if _used_setting == "used.txt" else _used_setting)
 
 CDP_URL = os.getenv(
     "CDP_URL",
@@ -64,6 +57,8 @@ FFMPEG_BIN = os.getenv(
     "FFMPEG_BIN",
     "ffmpeg",
 )
+
+JAMENDO_CLIENT_ID = os.getenv("JAMENDO_CLIENT_ID", "").strip()
 
 
 # ============================================================
@@ -339,6 +334,18 @@ def init_db():
         )
     """)
 
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(tracks)")}
+    for column, definition in {
+        "external_source": "TEXT",
+        "external_download_url": "TEXT",
+        "external_license_url": "TEXT",
+        "external_source_url": "TEXT",
+        "local_file_path": "TEXT",
+        "external_eligible": "INTEGER NOT NULL DEFAULT 1",
+    }.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE tracks ADD COLUMN {column} {definition}")
+
     conn.commit()
     conn.close()
 
@@ -596,6 +603,7 @@ def choose_from_list(
 def get_candidate_tracks(
     genre=None,
     mood=None,
+    source_filter=None,
 ):
     conn = db()
 
@@ -606,7 +614,9 @@ def get_candidate_tracks(
                 tu.use_count,
                 0
             ) AS use_count,
-            dt.file_path AS downloaded_file
+            dt.file_path AS downloaded_file,
+            t.external_source AS external_source,
+            t.local_file_path AS local_file_path
         FROM tracks t
         LEFT JOIN track_usage tu
             ON tu.track_id = t.track_id
@@ -614,6 +624,7 @@ def get_candidate_tracks(
             ON dt.track_id = t.track_id
         WHERE t.duration IS NOT NULL
           AND t.duration > 0
+          AND (t.external_source IS NULL OR t.external_source = 'local' OR COALESCE(t.external_eligible, 0) = 1)
         ORDER BY t.duration ASC
     """).fetchall()
 
@@ -638,16 +649,25 @@ def get_candidate_tracks(
         ):
             continue
 
-        if (
-            genre is not None
-            and genre not in row_genres(row)
-        ):
+        is_local = (
+            ("external_source" in row.keys() and row["external_source"] == "local")
+            or ("local_file_path" in row.keys() and row["local_file_path"] and Path(row["local_file_path"]).exists())
+        )
+
+        # 외부 전용 플레이리스트에서는 YouTube 트랙과 직접 보유한 로컬 파일을 제외합니다.
+        if source_filter:
+            row_source = (row["external_source"] or "") if "external_source" in row.keys() else ""
+            if source_filter == "external":
+                if not row_source or row_source == "local":
+                    continue
+            elif row_source != source_filter:
+                continue
+
+        # 사용자가 직접 받은 로컬 음원은 선택한 장르/Mood 필터와 무관하게 우선 후보로 포함합니다.
+        if not is_local and genre is not None and genre not in row_genres(row):
             continue
 
-        if (
-            mood is not None
-            and mood not in row_moods(row)
-        ):
+        if not is_local and mood is not None and mood not in row_moods(row):
             continue
 
         result.append(row)
@@ -681,8 +701,14 @@ def track_base_score(row):
         ),
     )
 
+    local_bonus = 100.0 if (
+        ("external_source" in row.keys() and row["external_source"] == "local")
+        or ("local_file_path" in row.keys() and row["local_file_path"] and Path(row["local_file_path"]).exists())
+    ) else 0.0
+
     return (
-        duration_quality
+        local_bonus
+        + duration_quality
         * DURATION_SCORE_WEIGHT
         + random.random()
         * RANDOMNESS_WEIGHT
@@ -992,6 +1018,9 @@ def build_playlist_items(
             "file_path": row["downloaded_file"] or "",
             "genre": primary_genre(row),
             "mood": primary_mood(row),
+            "source": (row["external_source"] if "external_source" in row.keys() and row["external_source"] else "YouTube Audio Library"),
+            "source_url": (row["external_source_url"] if "external_source_url" in row.keys() else "") or "",
+            "license_url": (row["external_license_url"] if "external_license_url" in row.keys() else "") or "",
         })
 
         current += duration
@@ -1416,6 +1445,63 @@ async def download_file(
                 file.write(chunk)
 
 
+def _probe_audio_duration_seconds(path: Path):
+    """Return decoded media duration, or None when ffprobe cannot inspect it."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        ffmpeg_path = shutil.which(FFMPEG_BIN)
+        if ffmpeg_path:
+            candidate = Path(ffmpeg_path).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+            if candidate.exists():
+                ffprobe = str(candidate)
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        return float(result.stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _validate_external_audio(path: Path, source: str, expected_duration: int = 0):
+    """Reject Openverse preview/snippet URLs that are much shorter than catalog metadata."""
+    if source != "openverse":
+        return
+
+    actual_duration = _probe_audio_duration_seconds(path)
+    # Small audio samples and preview clips are not useful as background music.
+    too_short = actual_duration is not None and actual_duration < 10
+    duration_mismatch = (
+        actual_duration is not None and expected_duration > 0
+        and actual_duration < max(10, expected_duration * 0.5)
+    )
+    suspiciously_small = path.stat().st_size < 32 * 1024
+    if too_short or duration_mismatch or suspiciously_small:
+        details = (
+            f"실제 길이 {actual_duration:.2f}초" if actual_duration is not None
+            else f"파일 크기 {path.stat().st_size:,} bytes"
+        )
+        if expected_duration > 0:
+            details += f", Openverse 메타데이터 길이 {expected_duration}초"
+        raise RuntimeError(
+            f"Openverse 음원이 미리듣기/일부 데이터일 수 있어 제외했습니다: {path.name} ({details}). "
+            "이 트랙은 다운로드 후보에서 제외하고 다른 곡을 선택하세요."
+        )
+
+
+def _remove_download_history(track_id):
+    conn = db()
+    conn.execute("DELETE FROM downloaded_tracks WHERE track_id = ?", (track_id,))
+    conn.commit()
+    conn.close()
+
+
 def find_downloaded_file(
     track_id,
 ):
@@ -1484,13 +1570,6 @@ async def ensure_downloaded(
         item["track_id"]
     )
 
-    if existing:
-        item["file_path"] = str(
-            existing
-        )
-
-        return existing
-
     conn = db()
 
     row = conn.execute("""
@@ -1509,26 +1588,56 @@ async def ensure_downloaded(
             f"{item['track_id']}"
         )
 
+    external_source = row["external_source"] if "external_source" in row.keys() else None
+    expected_duration = int(row["duration"] or 0)
+    if existing:
+        try:
+            _validate_external_audio(existing, external_source or "", expected_duration)
+        except RuntimeError as exc:
+            print(f"⚠️ 기존 다운로드 파일이 비정상이라 다시 받습니다: {exc}")
+            try:
+                existing.unlink(missing_ok=True)
+            except OSError:
+                pass
+            _remove_download_history(item["track_id"])
+        else:
+            item["file_path"] = str(existing)
+            return existing
+
     print(
         f"⬇ "
         f"{item['artist']} - "
         f"{item['title']}"
     )
 
-    url = await get_download_url(
-        client,
-        captured,
-        item["track_id"],
-    )
+    if row["track_id"].startswith("local:") and row["local_file_path"]:
+        local_path = Path(row["local_file_path"])
+        if local_path.exists():
+            item["file_path"] = str(local_path)
+            save_download_history(item["track_id"], item["title"], item["artist"], local_path)
+            return local_path
+
+    if external_source not in (None, "", "local"):
+        # Any provider with a direct, permitted download URL can use the same downloader.
+        url = row["external_download_url"]
+        if not url:
+            raise RuntimeError(
+                f"{external_source} 음원에 다운로드 URL이 없습니다: {item['title']}"
+            )
+    else:
+        url = await get_download_url(
+            client,
+            captured,
+            item["track_id"],
+        )
 
     genre = primary_genre(row)
     mood = primary_mood(row)
 
-    folder = (
-        DOWNLOAD_DIR
-        / safe_filename(genre)
-        / safe_filename(mood)
-    )
+    if external_source not in (None, "", "local"):
+        folder = DOWNLOAD_DIR / "external" / safe_filename(external_source) / safe_filename(genre) / safe_filename(mood)
+    else:
+        folder = DOWNLOAD_DIR / safe_filename(genre) / safe_filename(mood)
 
     folder.mkdir(
         parents=True,
@@ -1556,6 +1665,15 @@ async def ensure_downloaded(
         url,
         path,
     )
+
+    try:
+        _validate_external_audio(path, external_source or "", expected_duration)
+    except RuntimeError:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
     save_download_history(
         item["track_id"],
@@ -1678,13 +1796,16 @@ def write_description(
         / "youtube_description.txt"
     )
 
-    path.write_text(
-        make_youtube_description(
-            items
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    description = make_youtube_description(items)
+    external_items = [item for item in items if item.get("source") and item.get("source") != "YouTube Audio Library"]
+    if external_items:
+        description += "\n\nMusic credits / 라이선스 정보\n"
+        for item in external_items:
+            description += f"- {item.get('title', 'Unknown')} - {item.get('artist', 'Unknown')}\n"
+            description += f"  Source: {item.get('source_url') or item.get('source', '')}\n"
+            if item.get("license_url"):
+                description += f"  License: {item['license_url']}\n"
+    path.write_text(description + "\n", encoding="utf-8")
 
     return path
 
@@ -2511,8 +2632,28 @@ def commit_playlist(
     print(
         f"사용 처리: {len(items)}곡"
     )
+    # Commit된 곡은 기존 DB 사용 이력과 함께 used.txt에도 기록합니다.
+    existing_used = set()
+    if USED_FILE.exists():
+        existing_used = {
+            normalize_text(line).casefold()
+            for line in USED_FILE.read_text(encoding="utf-8-sig").splitlines()
+            if normalize_text(line) and not normalize_text(line).startswith("#")
+        }
+    used_to_add = []
+    for item in items:
+        entry = f"{item['artist']} - {item['title']}"
+        if entry.casefold() not in existing_used:
+            used_to_add.append(entry)
+            existing_used.add(entry.casefold())
+    if used_to_add:
+        USED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with USED_FILE.open("a", encoding="utf-8", newline="") as file:
+            for entry in used_to_add:
+                file.write(entry + "\n")
+
     print(
-        "다음 플레이리스트 후보에서 제외됩니다."
+        "used.txt 및 DB 사용 이력에 기록되어 다음 플레이리스트 후보에서 제외됩니다."
     )
     print("=" * 70)
 
@@ -2739,9 +2880,16 @@ def show_status():
 async def create_playlist(
     client,
     captured,
+    source_filter=None,
 ):
-    genres = get_all_genres()
-    moods = get_all_moods()
+    if source_filter:
+        source_candidates = get_candidate_tracks(None, None, source_filter=source_filter)
+        genres = sorted({g for row in source_candidates for g in row_genres(row)}, key=lambda x: display_genre(x).lower())
+        moods = sorted({m for row in source_candidates for m in row_moods(row)}, key=lambda x: display_mood(x).lower())
+    else:
+        source_candidates = None
+        genres = get_all_genres()
+        moods = get_all_moods()
 
     if not genres:
         print(
@@ -2790,10 +2938,17 @@ async def create_playlist(
         "Mood",
     )
 
-    candidates = get_candidate_tracks(
-        genre,
-        mood,
-    )
+    if source_filter:
+        candidates = [
+            row for row in source_candidates
+            if (genre is None or genre in row_genres(row))
+            and (mood is None or mood in row_moods(row))
+        ]
+    else:
+        candidates = get_candidate_tracks(
+            genre,
+            mood,
+        )
 
     print()
     print(
@@ -2839,7 +2994,7 @@ async def create_playlist(
 
     folder_name = (
         f"{timestamp}_"
-        f"{safe_filename(video_title or 'background_music')}"
+        f"{'external_' if source_filter else ''}{safe_filename(video_title or 'background_music')}"
     )
 
     playlist_dir = (
@@ -2861,26 +3016,31 @@ async def create_playlist(
     print("⬇️ 선택된 음악만 다운로드")
     print("=" * 80)
 
-    for index, item in enumerate(
-        items,
-        1,
-    ):
-        print(
-            f"\n[{index}/{len(items)}]"
-        )
+    if source_filter:
+        # External providers are downloaded concurrently with a small cap to avoid
+        # overloading a source or creating too many simultaneous connections.
+        semaphore = asyncio.Semaphore(3)
 
-        await ensure_downloaded(
-            client,
-            captured,
-            item,
-        )
+        async def download_one(index, item):
+            async with semaphore:
+                print(f"\n[{index}/{len(items)}] {item['artist']} - {item['title']}")
+                return await ensure_downloaded(client, captured, item)
 
-        await asyncio.sleep(
-            random.uniform(
-                0.3,
-                0.8,
-            )
+        results = await asyncio.gather(
+            *(download_one(index, item) for index, item in enumerate(items, 1)),
+            return_exceptions=True,
         )
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            for error in failures:
+                print(f"❌ 외부 음원 다운로드 실패: {error}")
+            print("다운로드 실패가 있어 합본 생성을 중단했습니다. 다시 시도할 수 있습니다.")
+            return
+    else:
+        for index, item in enumerate(items, 1):
+            print(f"\n[{index}/{len(items)}]")
+            await ensure_downloaded(client, captured, item)
+            await asyncio.sleep(random.uniform(0.3, 0.8))
 
     # --------------------------------------------------------
     # Copy individual tracks into playlist package
@@ -3003,6 +3163,48 @@ async def create_playlist(
 
 
 # ============================================================
+# EXTERNAL SOURCE HELPERS
+# ============================================================
+
+def get_external_sources():
+    """List external providers currently registered as playable tracks."""
+    conn = db()
+    try:
+        rows = conn.execute("""
+            SELECT DISTINCT external_source
+            FROM tracks
+            WHERE external_source IS NOT NULL
+              AND external_source NOT IN ('', 'local')
+              AND COALESCE(external_eligible, 0) = 1
+            ORDER BY external_source
+        """).fetchall()
+        return [row["external_source"] for row in rows]
+    finally:
+        conn.close()
+
+
+def choose_external_source():
+    sources = get_external_sources()
+    if not sources:
+        print("외부 플레이리스트 후보가 없습니다. 메뉴 9에서 카탈로그를 업데이트하세요.")
+        return None
+    options = ["모든 외부 사이트"] + sources
+    print("\n외부 음원 소스 선택")
+    for index, value in enumerate(options, 1):
+        label = "모든 외부 사이트" if value == "모든 외부 사이트" else value.capitalize()
+        print(f"{index:2}. {label}")
+    while True:
+        choice = input("\n소스 번호: ").strip()
+        try:
+            index = int(choice)
+            if 1 <= index <= len(options):
+                return "external" if index == 1 else options[index - 1]
+        except ValueError:
+            pass
+        print("올바른 번호를 입력하세요.")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -3032,83 +3234,55 @@ async def main():
     )
 
     async with async_playwright() as p:
-
-        browser = (
-            await p.chromium.connect_over_cdp(
-                CDP_URL
-            )
-        )
-
-        if not browser.contexts:
-            raise RuntimeError(
-                "Chrome BrowserContext를 "
-                "찾을 수 없습니다."
-            )
-
-        context = browser.contexts[0]
-
-        page = (
-            context.pages[0]
-            if context.pages
-            else await context.new_page()
-        )
-
+        # YouTube browser authentication is initialized lazily. External-only
+        # playlist generation must work even when Chrome/YouTube Studio is closed.
+        browser = None
+        context = None
+        page = None
         capture = GetTracksCapture()
+        listener = None
 
-        def listener(request):
-            asyncio.create_task(
-                capture.handle_request(
-                    request
+        async def ensure_youtube_capture():
+            nonlocal browser, context, page, listener
+
+            if context is None:
+                browser = await p.chromium.connect_over_cdp(CDP_URL)
+                if not browser.contexts:
+                    raise RuntimeError(
+                        "Chrome BrowserContext를 찾을 수 없습니다. Chrome을 디버깅 포트로 실행했는지 확인하세요."
+                    )
+                context = browser.contexts[0]
+                page = context.pages[0] if context.pages else await context.new_page()
+
+                def request_listener(request):
+                    asyncio.create_task(capture.handle_request(request))
+
+                listener = request_listener
+                page.on("request", listener)
+
+            if capture.request is not None:
+                capture.request["api_request"] = context.request
+                return capture.request
+
+            try:
+                await page.goto(
+                    STUDIO_URL,
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
                 )
-            )
+            except Exception as exc:
+                print(f"⚠️ Studio 이동 알림: {exc}")
 
-        page.on(
-            "request",
-            listener,
-        )
+            print()
+            print("YouTube Audio Library 다운로드 인증이 필요합니다.")
+            print("Studio 음악 페이지에서 아무 곡의 Download 버튼을 한 번 눌러주세요.")
+            try:
+                await asyncio.wait_for(capture.event.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                raise RuntimeError("5분 내 get_tracks 요청을 캡처하지 못했습니다.")
 
-        try:
-            await page.goto(
-                STUDIO_URL,
-                wait_until="domcontentloaded",
-                timeout=60_000,
-            )
-
-        except Exception as exc:
-            print(
-                f"⚠️ Studio 이동 알림: {exc}"
-            )
-
-        print()
-        print("=" * 80)
-        print(
-            "YouTube Audio Library "
-            "Download API 캡처"
-        )
-        print("=" * 80)
-
-        print(
-            "Studio 음악 페이지에서 "
-            "아무 곡의 Download 버튼을 "
-            "한 번 눌러주세요."
-        )
-
-        try:
-            await asyncio.wait_for(
-                capture.event.wait(),
-                timeout=300,
-            )
-
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                "5분 내 get_tracks 요청을 "
-                "캡처하지 못했습니다."
-            )
-
-        # get_tracks 재호출은 httpx가 아니라
-        # 현재 Chrome BrowserContext와 인증 세션을 공유하는
-        # Playwright APIRequestContext를 사용해야 합니다.
-        capture.request["api_request"] = context.request
+            capture.request["api_request"] = context.request
+            return capture.request
 
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -3163,6 +3337,14 @@ async def main():
                 )
 
                 print(
+                    "9. 외부 음원 메타데이터 업데이트 + 내 폴더 음원 등록"
+                )
+
+                print(
+                    "10. 외부 음원 플레이리스트 만들기 + 다운로드 (사이트별 장르/Mood)"
+                )
+
+                print(
                     "0. 종료"
                 )
 
@@ -3172,9 +3354,10 @@ async def main():
 
                 if choice == "1":
 
+                    captured = await ensure_youtube_capture()
                     await create_playlist(
                         client,
-                        capture.request,
+                        captured,
                     )
 
                 elif choice == "2":
@@ -3203,10 +3386,74 @@ async def main():
 
                 elif choice == "8":
 
+                    captured = await ensure_youtube_capture()
                     await remove_tracks_from_last_draft(
                         client,
-                        capture.request,
+                        captured,
                     )
+
+                elif choice == "9":
+
+                    print("\n[1/2] 직접 받은 음원 폴더 검색")
+                    registered, skipped = scan_local_music()
+                    print(f"내 폴더 음원 등록: {registered}곡 / 길이 확인 불가로 건너뜀: {skipped}곡")
+                    print("\n메타데이터 수집량은 MP3 다운로드량이 아닙니다. 음원 파일은 메뉴 10에서 선택한 곡만 받습니다.")
+                    raw_limit = input("Jamendo에서 수집할 총 메타데이터 수 (기본 2000, 최대 20000): ").strip()
+                    try:
+                        jamendo_limit = int(raw_limit) if raw_limit else 2000
+                        if jamendo_limit < 1 or jamendo_limit > 20000:
+                            raise ValueError
+                    except ValueError:
+                        print("잘못된 수집량입니다. 기본값 2000을 사용합니다.")
+                        jamendo_limit = 2000
+                    jamendo_selected = False
+                    if not JAMENDO_CLIENT_ID:
+                        print("Jamendo는 .env의 JAMENDO_CLIENT_ID가 없어 건너뜁니다.")
+                    else:
+                        jamendo_selected = input("\nJamendo 메타데이터를 페이지 단위로 수집할까요? (y/N): ").strip().lower() == "y"
+                    open_limit_raw = input("Openverse에서 수집할 메타데이터 수 (기본 500, 최대 5000, 0=건너뛰기): ").strip()
+                    try:
+                        open_limit = int(open_limit_raw) if open_limit_raw else 500
+                        if open_limit < 0 or open_limit > 5000:
+                            raise ValueError
+                    except ValueError:
+                        print("잘못된 수집량입니다. 기본값 500을 사용합니다.")
+                        open_limit = 500
+                    open_query = "instrumental music"
+                    if open_limit:
+                        open_query = input("Openverse 검색어 (Enter=instrumental music): ").strip() or "instrumental music"
+
+                    # Query the selected providers concurrently; each adapter writes
+                    # only its own provider section in the shared catalog.
+                    jobs = []
+                    job_names = []
+                    if jamendo_selected:
+                        jobs.append(update_jamendo_catalog(JAMENDO_CLIENT_ID, limit=jamendo_limit))
+                        job_names.append("Jamendo")
+                    if open_limit:
+                        jobs.append(update_openverse_catalog(limit=open_limit, query=open_query))
+                        job_names.append("Openverse")
+                    if jobs:
+                        results = await asyncio.gather(*jobs, return_exceptions=True)
+                        for provider_name, result in zip(job_names, results):
+                            if isinstance(result, Exception):
+                                print(f"❌ {provider_name} 업데이트 실패: {result}")
+                            else:
+                                metadata_count, eligible_count = result
+                                print(f"{provider_name} 메타데이터 저장: {metadata_count}곡")
+                                print(f"{provider_name} 플레이리스트 후보 통과: {eligible_count}곡")
+                    print(f"\n통합 카탈로그: {CATALOG_PATH.relative_to(BASE_DIR)}")
+                    print("\n주의: 자동 필터는 라이선스 위험을 줄일 뿐, 수익화 권리를 보증하지 않습니다. 게시 전 원본 페이지와 라이선스를 확인하세요.")
+
+                elif choice == "10":
+
+                    source_filter = choose_external_source()
+                    if source_filter:
+                        await create_playlist(
+                            client,
+                            None,
+                            source_filter=source_filter,
+                        )
 
                 elif choice == "0":
 
@@ -3218,10 +3465,8 @@ async def main():
                         "올바른 메뉴를 선택하세요."
                     )
 
-        page.remove_listener(
-            "request",
-            listener,
-        )
+        if page is not None and listener is not None:
+            page.remove_listener("request", listener)
 
 
 if __name__ == "__main__":

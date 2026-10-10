@@ -361,3 +361,49 @@ FFmpeg 확인:
 ```powershell
 ffmpeg -version
 ```
+
+# 외부 음원 연동
+
+## 1. 직접 다운로드한 음원 우선 사용
+
+외부 음원 등록/업데이트 메뉴는 YouTube 다운로드 인증을 먼저 캡처하지 않아도 실행할 수 있습니다. YouTube Audio Library가 필요한 메뉴(새 플레이리스트 생성, 싫은 곡 제거)를 처음 선택할 때만 Chrome/Studio 인증을 요청합니다.
+
+1. 프로젝트 루트에 `external_music` 폴더를 만듭니다.
+2. 직접 다운로드한 MP3/WAV/FLAC/OGG/M4A 파일을 넣습니다. 하위 폴더도 검색합니다.
+3. 권장 폴더 구조는 `external_music/장르/Mood/음원.mp3` 입니다. 예: `external_music/Jazz/Calm/song.mp3`
+4. 메뉴에서 `9. 외부 음원 메타데이터 업데이트 + 내 폴더 음원 등록`을 선택합니다.
+5. FFprobe가 설치되어 있으면 파일 길이를 자동으로 읽습니다. 길이를 확인하지 못한 파일은 등록을 건너뜁니다.
+6. 로컬 음원은 장르/Mood 필터에 관계없이 후보에 포함되고, 선택 점수에서 우선됩니다. 단, 전체 길이를 더 잘 맞추는 조합이 우선이므로 모든 로컬 음원을 무조건 다 넣는 것은 아닙니다.
+
+선택 사항으로 음원 옆에 같은 파일명의 JSON을 둘 수 있습니다. 예를 들어 `song.mp3`와 `song.json`:
+
+```json
+{
+  "title": "Song title",
+  "artist": "Artist name",
+  "genre": "Jazz",
+  "mood": "Calm",
+  "duration": 210,
+  "license_type": "CC BY 4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "source_url": "https://example.com/track-page"
+}
+```
+
+직접 받은 음원의 라이선스는 프로그램이 자동으로 검증할 수 없으므로 게시 전에 확인해야 합니다. 출처 정보가 필요한 음원은 JSON에 `license_url`과 `source_url`을 적어 두세요.
+
+## 2. 온라인 카탈로그 메타데이터 업데이트
+
+현재 구현된 온라인 카탈로그 공급자는 Jamendo API입니다.
+
+1. Jamendo 개발자 포털에서 앱/client ID를 발급합니다: https://devportal.jamendo.com/
+2. `.env`에 `JAMENDO_CLIENT_ID=발급받은_ID`를 설정합니다.
+3. 프로그램 메뉴에서 9번을 선택하고, 온라인 카탈로그 업데이트에 `y`를 입력합니다.
+4. 조건에 맞는 메타데이터는 `external_music_catalog.json`에 저장되며 `tracks.db`에도 등록됩니다.
+5. 플레이리스트에 선택된 온라인 음원은 필요한 시점에 다운로드됩니다. 전체 카탈로그의 오디오 파일을 한꺼번에 내려받지는 않습니다.
+
+자동 필터는 CC BY 및 CC0 라이선스만 허용하고, 다운로드 허용 플래그가 있는 곡만 등록합니다. 단, API의 사용 조건과 상업적 이용 조건은 별개입니다. Jamendo API 약관은 상업적 이용에 별도 허가가 필요할 수 있으므로, 수익화 채널에서 API를 쓰기 전에 Jamendo의 최신 약관/허가를 확인해야 합니다. 허가가 확인되지 않으면 온라인 카탈로그 기능 대신 라이선스를 직접 확인해 받은 음원을 `external_music`에 넣는 방식을 사용하세요.
+
+## 3. 사용 처리
+
+플레이리스트를 검토한 뒤 `2. 마지막 플레이리스트 Commit`을 선택하면 기존 DB 사용 이력에 기록되고, `used.txt`에도 `아티스트 - 제목` 형식으로 추가됩니다. 이후 후보에서 제외됩니다.
