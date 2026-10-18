@@ -1,0 +1,35 @@
+# Copy to config/profiles.toml to define your own search profiles.
+# A profile controls (a) what `sync` asks Jamendo/Openverse for and (b) default filters.
+
+[profiles.jazz-only]
+extends = "relax"
+genres = ["Jazz"]
+moods = ["calm", "warm"]
+vocals = "strict"                 # strict | lenient | any
+jamendo_tags = ["jazz", "smoothjazz", "bossanova"]
+openverse_queries = [
+  { q = "smooth jazz piano", genres = ["Jazz", "Piano"], moods = ["calm"] },
+  { q = "late night jazz", genres = ["Jazz"], moods = ["warm"] },
+]
+
+[profiles.rock]
+extends = "rock"
+genres = ["Rock"]
+moods = []
+vocals = "strict"                 # strict | lenient | any
+jamendo_tags = ["Rock"]
+openverse_queries = [
+  { q = "Rock", genres = ["Rock"], moods = [] },
+  { q = "instrumental", genres = ["Rock"], moods = [] },
+]
+
+[profiles.lofi]
+extends = "LoFi"
+genres = ["LoFi"]
+moods = ["calm"]
+vocals = "strict"                 # strict | lenient | any
+jamendo_tags = ["LoFi"]
+openverse_queries = [
+  { q = "LoFi", genres = ["LoFi"], moods = ["calm"] },
+  { q = "beats", genres = ["beats"], moods = ["calm"] },
+]

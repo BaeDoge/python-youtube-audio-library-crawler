@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "music-crawler"
+version = "0.2.0"
+description = "Collect license-safe calm/instrumental music and assemble fixed-length background-music playlists for videos."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Only needed for the YouTube Audio Library provider (drives a logged-in Chrome).
+youtube = ["playwright>=1.50"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+music-crawler = "music_crawler.cli:main"
+mc = "music_crawler.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/music_crawler"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
