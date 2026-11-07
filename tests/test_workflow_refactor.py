@@ -2,8 +2,7 @@ from pathlib import Path
 
 from conftest import make_track
 
-from music_crawler import audio
-from music_crawler import cli
+from music_crawler import audio, cli
 from music_crawler.cli import main
 from music_crawler.playlist import Item, Playlist
 from music_crawler.selector import Criteria
