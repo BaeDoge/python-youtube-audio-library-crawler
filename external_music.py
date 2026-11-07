@@ -200,11 +200,13 @@ def _save_catalog_source(source_key: str, source_name: str, tracks: list[dict], 
 
 
 async def update_jamendo_catalog(client_id: str, limit: int = 2000) -> tuple[int, int]:
-    """Paginate Jamendo metadata in batches of <=200.
+    """Collect up to `limit` unique Jamendo track metadata records.
 
-    `limit` is the desired total metadata count across all API pages, not the
-    per-request limit. Returns (new catalog metadata count, eligible count).
-    Only CC0/CC BY tracks with explicit audio-download permission enter DB.
+    Jamendo's API caps each request at 200 rows. Some query/order streams may
+    stop returning rows at a low offset, so this collector tries several stable
+    orderings rather than treating the first exhausted stream as the end of the
+    entire collection. Duplicate IDs advance the API offset but do not count
+    toward the requested unique-metadata target.
     """
     if not client_id.strip():
         raise ValueError("JAMENDO_CLIENT_ID is empty. Add it to .env first.")
@@ -215,42 +217,111 @@ async def update_jamendo_catalog(client_id: str, limit: int = 2000) -> tuple[int
     page_size = 200  # Jamendo API maximum per request
     fetched: list[dict] = []
     seen: set[str] = set()
+    # Separate ordering streams help when one API ordering stops early.
+    order_streams = (
+        "popularity_total_desc",
+        "id_asc",
+        "releasedate_desc",
+        "name_asc",
+    )
+    pages_fetched = 0
+    empty_pages = 0
+    stream_summaries: list[dict] = []
+
     async with httpx.AsyncClient(timeout=45, follow_redirects=True) as client:
-        offset = 0
-        while len(fetched) < total_limit:
-            request_limit = min(page_size, total_limit - len(fetched))
-            params = {
-                "client_id": client_id.strip(), "format": "json",
-                "limit": request_limit, "offset": offset,
-                "include": "licenses musicinfo", "order": "popularity_total",
-                "type": "albumtrack single", "audiodlformat": "mp32",
-            }
-            response = await client.get(JAMENDO_API, params=params)
-            response.raise_for_status()
-            payload = response.json()
-            headers = payload.get("headers") or {}
-            if str(headers.get("status", "")).lower() == "error" or headers.get("error_message"):
-                raise RuntimeError(f"Jamendo API 오류 (offset={offset}): {headers.get('error_message') or headers}")
-            batch = payload.get("results") or []
-            if not batch:
+        for order in order_streams:
+            if len(fetched) >= total_limit:
                 break
-            new_in_batch = 0
-            for track in batch:
-                track_id = str(track.get("id") or "")
-                if not track_id or track_id in seen:
-                    continue
-                seen.add(track_id)
-                fetched.append(track)
-                new_in_batch += 1
-                if len(fetched) >= total_limit:
+            offset = 0
+            stream_added = 0
+            consecutive_duplicate_pages = 0
+            stream_pages = 0
+            while len(fetched) < total_limit:
+                request_limit = min(page_size, total_limit - len(fetched))
+                params = {
+                    "client_id": client_id.strip(), "format": "json",
+                    "limit": request_limit, "offset": offset,
+                    "include": "licenses musicinfo", "order": order,
+                    "type": "albumtrack single", "audiodlformat": "mp32",
+                }
+                payload = None
+                last_error = None
+                # Retry transient network/API failures before abandoning a page.
+                for attempt in range(1, 4):
+                    try:
+                        response = await client.get(JAMENDO_API, params=params)
+                        response.raise_for_status()
+                        candidate_payload = response.json()
+                        headers = candidate_payload.get("headers") or {}
+                        if str(headers.get("status", "")).lower() == "error" or headers.get("error_message"):
+                            raise RuntimeError(headers.get("error_message") or str(headers))
+                        payload = candidate_payload
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < 3:
+                            import asyncio
+                            await asyncio.sleep(0.75 * attempt)
+                if payload is None:
+                    print(f"Jamendo 페이지 실패: order={order}, offset={offset}, 재시도 3회 실패: {last_error}")
                     break
-            print(f"Jamendo 수집 진행: {len(fetched):,}/{total_limit:,}곡 (offset={offset})")
-            if len(batch) < request_limit or new_in_batch == 0:
-                break
-            offset += len(batch)
+
+                batch = payload.get("results") or []
+                headers = payload.get("headers") or {}
+                results_count = headers.get("results_count", len(batch))
+                if not batch:
+                    empty_pages += 1
+                    print(
+                        f"Jamendo 빈 페이지: order={order}, offset={offset}, "
+                        f"results_count={results_count}; 다음 정렬 조건을 시도합니다."
+                    )
+                    break
+
+                pages_fetched += 1
+                stream_pages += 1
+                new_in_batch = 0
+                for track in batch:
+                    track_id = str(track.get("id") or "").strip()
+                    if not track_id or track_id in seen:
+                        continue
+                    seen.add(track_id)
+                    fetched.append(track)
+                    new_in_batch += 1
+                    stream_added += 1
+                    if len(fetched) >= total_limit:
+                        break
+
+                print(
+                    f"Jamendo 수집 진행: {len(fetched):,}/{total_limit:,}곡 "
+                    f"(order={order}, offset={offset}, page={len(batch)}, "
+                    f"신규={new_in_batch}, API results_count={results_count})"
+                )
+
+                # Always advance by the number of rows returned by the API,
+                # including duplicates. Never stop the entire collection merely
+                # because a page contained duplicate IDs.
+                offset += len(batch)
+                if new_in_batch == 0:
+                    consecutive_duplicate_pages += 1
+                else:
+                    consecutive_duplicate_pages = 0
+                if consecutive_duplicate_pages >= 2:
+                    print(f"Jamendo 중복 페이지 반복: order={order}; 다음 정렬 조건을 시도합니다.")
+                    break
+                if len(batch) < request_limit:
+                    # A short page is normally the end of this ordering only.
+                    print(f"Jamendo 정렬 조건 종료: order={order}, 반환 {len(batch)}/{request_limit}곡")
+                    break
+            stream_summaries.append({
+                "order": order, "pages": stream_pages,
+                "unique_added": stream_added, "last_offset": offset,
+            })
 
     if not fetched:
-        raise RuntimeError("Jamendo API 응답 결과가 0곡입니다. Client ID와 API 앱 상태를 확인하세요.")
+        raise RuntimeError(
+            "Jamendo API에서 메타데이터를 가져오지 못했습니다. "
+            "Client ID, API 상태, 네트워크 응답을 확인하세요."
+        )
 
     now = datetime.now().isoformat(timespec="seconds")
     conn = sqlite3.connect(DB_PATH)
@@ -308,9 +379,22 @@ async def update_jamendo_catalog(client_id: str, limit: int = 2000) -> tuple[int
         eligible_count += 1
     conn.commit()
     conn.close()
+
+    complete = len(catalog) >= total_limit
+    print(
+        f"Jamendo 수집 종료: 고유 메타데이터 {len(catalog):,}/{total_limit:,}, "
+        f"플레이리스트 적격 {eligible_count:,}, 목표 달성={'예' if complete else '아니오'}"
+    )
+    if not complete:
+        print(
+            "안내: Jamendo API의 모든 정렬 조건에서 더 이상 새 곡을 받지 못했습니다. "
+            "API가 반환한 결과 한도 또는 네트워크/API 제한일 수 있으며, 요청 목표 달성으로 처리하지 않았습니다."
+        )
+
     _save_catalog_source("jamendo", "Jamendo API", catalog, eligible_count, {
         "requested_limit": total_limit, "page_size": page_size,
-        "pages_fetched": (len(fetched) + page_size - 1) // page_size,
+        "pages_fetched": pages_fetched, "empty_pages": empty_pages,
+        "collection_complete": complete, "order_streams": stream_summaries,
     })
     return len(catalog), eligible_count
 
@@ -401,6 +485,8 @@ async def update_openverse_catalog(limit: int = 1000, query: str = "instrumental
     per_query_target = max(1, (total_limit + len(queries) - 1) // len(queries))
     fetched: list[dict] = []
     seen: set[str] = set()
+    seen_media: set[str] = set()
+    seen_title_artist: set[tuple[str, str]] = set()
     async with httpx.AsyncClient(timeout=45, follow_redirects=True, headers={"User-Agent": "MusicManager/1.0 (open-license audio catalog)"}) as client:
         for query_index, search_query in enumerate(queries, 1):
             if len(fetched) >= total_limit:
@@ -429,7 +515,26 @@ async def update_openverse_catalog(limit: int = 1000, query: str = "instrumental
                     identifier = str(item.get("id") or item.get("foreign_landing_url") or item.get("url") or "")
                     if not identifier or identifier in seen:
                         continue
+                    # Openverse can index the same recording more than once under
+                    # different IDs/providers. Deduplicate by canonical media URL and
+                    # normalized title/creator before the records reach SQLite.
+                    media_url = str(item.get("url") or "").strip()
+                    media_key = ""
+                    if media_url:
+                        from urllib.parse import urlparse, unquote
+                        parsed = urlparse(media_url)
+                        media_key = f"{parsed.netloc.lower()}{unquote(parsed.path).rstrip('/')}".casefold()
+                    title_key = re.sub(r"\s+", " ", str(item.get("title") or "").strip()).casefold()
+                    creator_key = re.sub(r"\s+", " ", str(item.get("creator") or "").strip()).casefold()
+                    pair_key = (creator_key, title_key)
+                    if (media_key and media_key in seen_media) or (title_key and pair_key in seen_title_artist):
+                        seen.add(identifier)
+                        continue
                     seen.add(identifier)
+                    if media_key:
+                        seen_media.add(media_key)
+                    if title_key:
+                        seen_title_artist.add(pair_key)
                     fetched.append(item)
                     query_count += 1
                     new_count += 1
@@ -438,8 +543,10 @@ async def update_openverse_catalog(limit: int = 1000, query: str = "instrumental
                 print(f"Openverse 검색 {query_index}/{len(queries)} [{search_query}]: 전체 {len(fetched):,}/{total_limit:,}곡 (page={page})")
                 page_count = int(payload.get("page_count") or 0)
                 has_next = bool(payload.get("next")) or (page_count > 0 and page < page_count)
-                if new_count == 0 or not has_next:
+                if not has_next:
                     break
+                # A page containing only duplicate records is not end-of-results;
+                # continue pagination to find unique tracks on later pages.
                 page += 1
 
     if not fetched:
@@ -449,10 +556,9 @@ async def update_openverse_catalog(limit: int = 1000, query: str = "instrumental
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     _ensure_columns(conn)
-    # Older versions mistakenly treated Openverse milliseconds as seconds. Clear
-    # prior validation blacklists and revalidate any selected tracks against their
-    # now-normalized durations when downloaded again.
-    conn.execute("UPDATE tracks SET external_validation_failed=0 WHERE external_source='openverse'")
+    # Keep tracks that have already failed a real download/media validation
+    # excluded across catalog refreshes. Their failure marker is cleared only by
+    # an explicit future recovery workflow, not by simply seeing metadata again.
     # Deactivate stale Openverse rows from previous searches. Current results are re-enabled below.
     conn.execute("UPDATE tracks SET external_eligible=0 WHERE external_source='openverse'")
     catalog: list[dict] = []

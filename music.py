@@ -1,4 +1,6 @@
 import asyncio
+import csv
+import hashlib
 import json
 import os
 import random
@@ -9,6 +11,7 @@ import subprocess
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse, unquote, urldefrag
 
 import httpx
 from dotenv import load_dotenv
@@ -342,9 +345,27 @@ def init_db():
         "external_source_url": "TEXT",
         "local_file_path": "TEXT",
         "external_eligible": "INTEGER NOT NULL DEFAULT 1",
+        "external_validation_failed": "INTEGER NOT NULL DEFAULT 0",
     }.items():
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE tracks ADD COLUMN {column} {definition}")
+
+    # One-time recovery: older versions marked every Openverse track as permanently
+    # invalid when ffprobe was unavailable. Restore those rows once so the new
+    # validator can check them correctly; future confirmed-invalid files are still
+    # excluded by the updated downloader.
+    conn.execute("CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+    migration_name = "openverse_probe_blacklist_recovery_20261013_v1"
+    migration = conn.execute("SELECT 1 FROM app_migrations WHERE name = ?", (migration_name,)).fetchone()
+    if not migration:
+        conn.execute(
+            "UPDATE tracks SET external_eligible=1, external_validation_failed=0 "
+            "WHERE external_source='openverse' AND COALESCE(external_validation_failed, 0)=1"
+        )
+        conn.execute(
+            "INSERT INTO app_migrations(name, applied_at) VALUES (?, ?)",
+            (migration_name, datetime.now().isoformat(timespec="seconds")),
+        )
 
     conn.commit()
     conn.close()
@@ -600,6 +621,64 @@ def choose_from_list(
 # TRACK QUERY
 # ============================================================
 
+def _track_dedupe_key(row):
+    """Stable duplicate key for repeated catalog records of the same recording."""
+    keys = row.keys() if hasattr(row, "keys") else row
+    title = normalize_text(row["title"] if "title" in keys else "").casefold()
+    artist = normalize_text(row["artist"] if "artist" in keys else "").casefold()
+    source = normalize_text(row["external_source"] if "external_source" in keys else "").casefold()
+    url = normalize_text(row["external_download_url"] if "external_download_url" in keys else "")
+    if url:
+        # Ignore tracking/query parameters that may differ for the same media asset.
+        parsed = urlparse(url)
+        url_key = f"{parsed.netloc.lower()}{unquote(parsed.path).rstrip('/')}".casefold()
+        return ("url", source, url_key)
+    return ("title_artist", source, artist, title)
+
+
+def _track_identity(row):
+    """Stable recording identity independent of DB/provider IDs and cosmetic punctuation."""
+    keys = row.keys() if hasattr(row, "keys") else row
+    artist = normalize_text(row["artist"] if "artist" in keys else "").casefold()
+    title = normalize_text(row["title"] if "title" in keys else "").casefold()
+    # Ignore punctuation, repeated whitespace, and case differences. Keep Unicode
+    # letters/digits so non-English artist names remain distinguishable.
+    artist_key = "".join(ch for ch in artist if ch.isalnum())
+    title_key = "".join(ch for ch in title if ch.isalnum())
+    if artist_key and title_key:
+        return (artist_key, title_key)
+    track_id = normalize_text(row["track_id"] if "track_id" in keys else "")
+    return ("track_id", track_id) if track_id else None
+
+
+def deduplicate_tracks(rows):
+    """Deduplicate repeated IDs, media URLs, and identical artist/title recordings."""
+    result = []
+    seen_ids = set()
+    seen_urls = set()
+    seen_recordings = set()
+    for row in rows:
+        keys = row.keys() if hasattr(row, "keys") else row
+        track_id = normalize_text(row["track_id"] if "track_id" in keys else "")
+        url = normalize_text(row["external_download_url"] if "external_download_url" in keys else "")
+        url_key = ""
+        if url:
+            parsed = urlparse(url)
+            url_key = f"{parsed.netloc.lower()}{unquote(parsed.path).rstrip('/')}".casefold()
+        identity = _track_identity(row)
+        if ((track_id and track_id in seen_ids)
+                or (url_key and url_key in seen_urls)
+                or (identity and identity in seen_recordings)):
+            continue
+        if track_id:
+            seen_ids.add(track_id)
+        if url_key:
+            seen_urls.add(url_key)
+        if identity:
+            seen_recordings.add(identity)
+        result.append(row)
+    return result
+
 def get_candidate_tracks(
     genre=None,
     mood=None,
@@ -654,10 +733,16 @@ def get_candidate_tracks(
             or ("local_file_path" in row.keys() and row["local_file_path"] and Path(row["local_file_path"]).exists())
         )
 
-        # 외부 전용 플레이리스트에서는 YouTube 트랙과 직접 보유한 로컬 파일을 제외합니다.
+        # 소스 경계를 엄격하게 유지합니다.
+        # - youtube: YouTube Audio Library만 허용 (외부 제공자 및 local 제외)
+        # - external: Jamendo/Openverse 등 외부 제공자만 허용 (local 제외)
+        # - 특정 제공자: 해당 제공자의 트랙만 허용
         if source_filter:
             row_source = (row["external_source"] or "") if "external_source" in row.keys() else ""
-            if source_filter == "external":
+            if source_filter == "youtube":
+                if row_source != "":
+                    continue
+            elif source_filter == "external":
                 if not row_source or row_source == "local":
                     continue
             elif row_source != source_filter:
@@ -672,7 +757,7 @@ def get_candidate_tracks(
 
         result.append(row)
 
-    return result
+    return deduplicate_tracks(result)
 
 
 # ============================================================
@@ -811,140 +896,136 @@ def find_best_playlist(
     tracks,
     target_seconds,
 ):
-    valid = [
-        row
-        for row in tracks
-        if int(row["duration"])
-        <= target_seconds
-    ]
+    """Choose a duration-fitting playlist without duplicate recordings.
+
+    This implementation intentionally never overwrites a valid duration state
+    with an empty list. The previous beam-search loop could mutate a destination
+    list while iterating it, then replace a populated state with an empty one;
+    max(states[best_sum]) would consequently raise ValueError.
+    """
+    tracks = deduplicate_tracks(tracks)
+
+    try:
+        target_seconds = int(target_seconds)
+    except (TypeError, ValueError):
+        return []
+
+    if target_seconds <= 0:
+        return []
+
+    valid = []
+    for row in tracks:
+        try:
+            duration = int(row["duration"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 < duration <= target_seconds:
+            valid.append(row)
 
     if not valid:
         return []
 
     valid = sorted(
         valid,
-        key=lambda row:
-            (
-                int(row["duration"]),
-                -track_base_score(row),
-            ),
+        key=lambda row: (
+            int(row["duration"]),
+            -track_base_score(row),
+        ),
     )
 
-    states = {
-        0: [
-            (
-                0.0,
-                (),
-            )
-        ]
-    }
+    # duration -> [(score, tuple(candidate indexes))]. Keep only non-empty
+    # states, and build additions separately so we never iterate a list while
+    # appending to that same list.
+    states = {0: [(0.0, ())]}
 
-    for candidate_index, candidate in enumerate(
-        valid
-    ):
-        duration = int(
-            candidate["duration"]
-        )
+    for candidate_index, candidate in enumerate(valid):
+        duration = int(candidate["duration"])
+        candidate_identity = _track_identity(candidate)
+        additions = {}
 
-        current_states = list(
-            states.items()
-        )
+        for current_sum, state_list in list(states.items()):
+            if not state_list:
+                continue
 
-        for current_sum, candidates in current_states:
-
-            new_sum = (
-                current_sum
-                + duration
-            )
-
+            new_sum = current_sum + duration
             if new_sum > target_seconds:
                 continue
 
-            destination = states.setdefault(
-                new_sum,
-                [],
-            )
+            destination = additions.setdefault(new_sum, [])
 
-            for base_score, indexes in candidates:
+            for base_score, indexes in state_list:
+                if len(indexes) >= MAX_TRACKS_PER_PLAYLIST:
+                    continue
 
-                if (
-                    len(indexes)
-                    >= MAX_TRACKS_PER_PLAYLIST
+                selected_rows = [valid[i] for i in indexes]
+                if candidate_identity and any(
+                    _track_identity(existing) == candidate_identity
+                    for existing in selected_rows
                 ):
                     continue
 
-                selected_rows = [
-                    valid[i]
-                    for i in indexes
-                ]
+                score = base_score + state_score(selected_rows, candidate)
+                destination.append((score, indexes + (candidate_index,)))
 
-                score = (
-                    base_score
-                    + state_score(
-                        selected_rows,
-                        candidate,
-                    )
-                )
+        # Merge new combinations with prior valid combinations. If no new
+        # combinations were generated for a duration, preserve its old states.
+        for duration_sum, new_states in additions.items():
+            if not new_states:
+                continue
 
-                destination.append(
-                    (
-                        score,
-                        indexes
-                        + (
-                            candidate_index,
-                        ),
-                    )
-                )
-
-            destination.sort(
-                key=lambda x: x[0],
-                reverse=True,
-            )
+            merged = list(states.get(duration_sum, [])) + new_states
+            merged.sort(key=lambda item: item[0], reverse=True)
 
             unique = []
-
-            seen = set()
-
-            for item in destination:
+            seen_indexes = set()
+            seen_recordings = set()
+            for item in merged:
                 indexes = item[1]
-
-                if indexes in seen:
+                if indexes in seen_indexes:
                     continue
 
-                seen.add(indexes)
+                recording_keys = tuple(
+                    _track_identity(valid[i]) for i in indexes
+                )
+                # Defensive combo-level dedupe in case a future change bypasses
+                # the candidate-level identity check.
+                if len(recording_keys) != len(set(recording_keys)):
+                    continue
 
+                seen_indexes.add(indexes)
+                seen_recordings.add(recording_keys)
                 unique.append(item)
-
-                if len(unique) >= (
-                    BEAM_WIDTH_PER_DURATION
-                ):
+                if len(unique) >= BEAM_WIDTH_PER_DURATION:
                     break
 
-            states[new_sum] = unique
+            if unique:
+                states[duration_sum] = unique
 
-    if not states:
+    available_states = [
+        (duration_sum, state_list)
+        for duration_sum, state_list in states.items()
+        if state_list
+    ]
+    if not available_states:
         return []
 
-    best_sum = max(
-        states.keys()
-    )
+    best_sum = max(duration_sum for duration_sum, _ in available_states)
+    best_options = states.get(best_sum) or []
+    if not best_options:
+        # Last-resort safety: choose the best available state instead of raising.
+        best_sum, best_options = max(
+            available_states,
+            key=lambda pair: pair[0],
+        )
 
-    best_state = max(
-        states[best_sum],
-        key=lambda x: x[0],
-    )
-
+    best_state = max(best_options, key=lambda item: item[0])
     indexes = best_state[1]
+    if not indexes:
+        return []
 
-    selected = [
-        valid[i]
-        for i in indexes
-    ]
-
-    selected = arrange_tracks(
-        selected
-    )
-
+    selected = [valid[i] for i in indexes]
+    selected = deduplicate_tracks(selected)
+    selected = arrange_tracks(selected)
     return selected
 
 
@@ -1422,15 +1503,23 @@ async def download_file(
     client,
     url,
     path,
+    referer="",
 ):
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
+        "Accept": "audio/*,application/octet-stream;q=0.9,*/*;q=0.8",
+    }
+    if referer:
+        headers["Referer"] = referer
     async with client.stream(
         "GET",
         url,
+        headers=headers,
     ) as response:
 
         response.raise_for_status()
@@ -1446,27 +1535,70 @@ async def download_file(
 
 
 def _probe_audio_duration_seconds(path: Path):
-    """Return decoded media duration, or None when ffprobe cannot inspect it."""
+    """Probe duration with ffprobe, then ffmpeg. Return None only if neither works."""
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
-        ffmpeg_path = shutil.which(FFMPEG_BIN)
+        ffmpeg_path = get_ffmpeg_path()
         if ffmpeg_path:
             candidate = Path(ffmpeg_path).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
             if candidate.exists():
                 ffprobe = str(candidate)
-    if not ffprobe:
-        return None
+    if ffprobe:
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return float(result.stdout.strip())
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+
+    # ffprobe is not always bundled on Windows; ffmpeg can still identify media.
+    ffmpeg = get_ffmpeg_path()
+    if ffmpeg:
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-hide_banner", "-i", str(path)],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            output = (result.stderr or "") + "\n" + (result.stdout or "")
+            match = re.search(r"Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)", output)
+            if match:
+                hours, minutes, seconds = match.groups()
+                return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return None
+
+
+def _looks_like_audio_file(path: Path) -> bool:
+    """Lightweight signature check used when duration probing tools are unavailable."""
     try:
-        result = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-            capture_output=True, text=True, timeout=20, check=False,
-        )
-        if result.returncode != 0:
-            return None
-        return float(result.stdout.strip())
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
+        with path.open("rb") as stream:
+            head = stream.read(64 * 1024)
+    except OSError:
+        return False
+    if not head:
+        return False
+    # Common audio container / codec signatures. MP3 can start with ID3 or MPEG sync.
+    if head.startswith((b"OggS", b"RIFF", b"fLaC", b"ID3", bytes([0x1a, 0x45, 0xdf, 0xa3]))):
+        return True
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return True
+    # ISO BMFF (M4A/AAC) often contains ftyp near the start.
+    if b"ftyp" in head[:32]:
+        return True
+    return False
+
+
+def _audio_extension_from_url(url: str) -> str:
+    """Preserve the actual container extension instead of naming every download .mp3."""
+    suffix = Path(unquote(urlparse(url).path)).suffix.lower()
+    mapping = {".oga": ".ogg", ".opus": ".opus", ".mpga": ".mp3"}
+    suffix = mapping.get(suffix, suffix)
+    return suffix if suffix in {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus"} else ".audio"
 
 
 def _mark_external_track_ineligible(track_id, reason="invalid audio file"):
@@ -1486,35 +1618,32 @@ def _mark_external_track_ineligible(track_id, reason="invalid audio file"):
 
 
 def _validate_external_audio(path: Path, source: str, expected_duration: int = 0):
-    """Reject Openverse previews, error pages, and duration-inconsistent files.
-
-    expected_duration is normalized to seconds in the database; Openverse's raw
-    API duration is milliseconds and is converted in external_music.py.
-    """
+    """Reject clear invalid files, but don't reject/blacklist audio just because ffprobe is absent."""
     if source != "openverse":
         return
+    if not path.is_file():
+        raise RuntimeError(f"다운로드 파일이 없습니다: {path}")
+    file_size = path.stat().st_size
+    if file_size < 32 * 1024:
+        raise RuntimeError(f"Openverse 다운로드 파일이 너무 작습니다 ({file_size:,} bytes): {path.name}")
 
     actual_duration = _probe_audio_duration_seconds(path)
-    file_size = path.stat().st_size if path.exists() else 0
-    too_short = actual_duration is not None and actual_duration < 10
-    # Openverse's API duration can be wrong, but accepting a large mismatch makes
-    # generated timestamps and target playlist length misleading. Allow 15% drift.
-    duration_mismatch = (
-        actual_duration is not None and expected_duration > 0
-        and abs(actual_duration - expected_duration) > max(8, expected_duration * 0.15)
-    )
-    suspiciously_small = file_size < 32 * 1024
-    if actual_duration is None or too_short or duration_mismatch or suspiciously_small:
-        details = (
-            f"실제 길이 {actual_duration:.2f}초" if actual_duration is not None
-            else "ffprobe로 오디오 길이를 확인할 수 없음"
-        )
-        details += f", 파일 크기 {file_size:,} bytes"
-        if expected_duration > 0:
-            details += f", Openverse 메타데이터 길이 {expected_duration}초"
+    if actual_duration is None:
+        # Tooling limitation is not evidence that the track itself is corrupt.
+        # Confirm the file looks like media; trust Openverse duration provisionally.
+        if not _looks_like_audio_file(path):
+            raise RuntimeError(
+                f"다운로드 파일이 오디오 형식으로 확인되지 않습니다 ({file_size:,} bytes): {path.name}. "
+                "ffprobe/ffmpeg 설치 여부와 원본 URL을 확인하세요."
+            )
+        return
+
+    if actual_duration < 10:
+        raise RuntimeError(f"실제 오디오 길이가 너무 짧습니다 ({actual_duration:.2f}초): {path.name}")
+    if expected_duration > 0 and abs(actual_duration - expected_duration) > max(12, expected_duration * 0.20):
         raise RuntimeError(
-            f"Openverse 음원이 미리듣기/일부 데이터이거나 메타데이터 길이와 맞지 않아 제외했습니다: "
-            f"{path.name} ({details})."
+            f"실제 길이와 Openverse 메타데이터가 크게 다릅니다: {path.name} "
+            f"(실제 {actual_duration:.1f}초 / 메타데이터 {expected_duration}초)"
         )
 
 
@@ -1675,18 +1804,28 @@ async def ensure_downloaded(
         f"{safe_filename(item['title'])}"
     )
 
-    path = folder / (
-        f"{base}.mp3"
-    )
+    extension = _audio_extension_from_url(url) if external_source not in (None, "", "local") else ".mp3"
+    path = folder / f"{base}{extension}"
 
     if path.exists():
-        path = folder / (
-            f"{base} "
-            f"[{item['track_id']}].mp3"
-        )
+        path = folder / f"{base} [{safe_filename(item['track_id'])}]{extension}"
 
     try:
-        await download_file(client, url, path)
+        await download_file(
+            client, url, path,
+            referer=(row["external_source_url"] if "external_source_url" in row.keys() else ""),
+        )
+        if path.suffix == ".audio":
+            try:
+                with path.open("rb") as stream:
+                    header = stream.read(16)
+                inferred = ".ogg" if header.startswith(b"OggS") else ".wav" if header.startswith(b"RIFF") else ".flac" if header.startswith(b"fLaC") else ".mp3" if header.startswith(b"ID3") or (len(header) > 1 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0) else ".audio"
+                if inferred != ".audio":
+                    renamed = path.with_suffix(inferred)
+                    path.rename(renamed)
+                    path = renamed
+            except OSError:
+                pass
         _validate_external_audio(path, external_source or "", expected_duration)
     except Exception as exc:
         try:
@@ -1695,7 +1834,19 @@ async def ensure_downloaded(
             pass
         if external_source == "openverse":
             _remove_download_history(item["track_id"])
-            _mark_external_track_ineligible(item["track_id"], str(exc))
+            # HTTP 403/429, timeouts and connection errors are not proof of corrupt audio.
+            # Only permanently exclude tracks that failed an actual file/media check.
+            permanently_unusable = isinstance(exc, RuntimeError) and any(marker in str(exc) for marker in (
+                "다운로드 파일이 없습니다", "너무 작습니다", "오디오 형식으로 확인되지 않습니다",
+                "실제 오디오 길이", "실제 길이와 Openverse",
+            ))
+            # A media URL that repeatedly denies direct access is not usable by this
+            # downloader. Exclude clear dead/forbidden URLs from future selections.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in (403, 404, 410):
+                permanently_unusable = True
+            if permanently_unusable:
+                _mark_external_track_ineligible(item["track_id"], str(exc))
         raise
 
     save_download_history(
@@ -2333,9 +2484,20 @@ async def remove_tracks_from_last_draft(
         for item in items
     }
 
+    # Keep replacement tracks in the same source family as the current playlist.
+    # This prevents menu 8 from introducing Openverse/Jamendo into a YouTube playlist.
+    first_source = (items[0].get("source") if items else "YouTube Audio Library") or "YouTube Audio Library"
+    if first_source == "YouTube Audio Library":
+        replacement_source_filter = "youtube"
+    elif first_source in ("local",):
+        replacement_source_filter = "local"
+    else:
+        replacement_source_filter = first_source.casefold()
+
     candidates = get_candidate_tracks(
         genre,
         mood,
+        source_filter=replacement_source_filter,
     )
 
     candidates = [
@@ -2908,13 +3070,21 @@ async def create_playlist(
     source_filter=None,
 ):
     if source_filter:
+        # Menu 10: 외부 음원 플레이리스트. 선택한 사이트/전체 외부 사이트의 후보만 사용.
         source_candidates = get_candidate_tracks(None, None, source_filter=source_filter)
-        genres = sorted({g for row in source_candidates for g in row_genres(row)}, key=lambda x: display_genre(x).lower())
-        moods = sorted({m for row in source_candidates for m in row_moods(row)}, key=lambda x: display_mood(x).lower())
     else:
-        source_candidates = None
-        genres = get_all_genres()
-        moods = get_all_moods()
+        # Menu 1: YouTube Audio Library 전용. 외부 카탈로그의 장르/Mood가
+        # 메뉴에 섞이지 않도록 후보와 필터 목록을 모두 YouTube 트랙에서만 구성.
+        source_candidates = get_candidate_tracks(None, None, source_filter="youtube")
+
+    genres = sorted(
+        {g for row in source_candidates for g in row_genres(row)},
+        key=lambda x: display_genre(x).casefold(),
+    )
+    moods = sorted(
+        {m for row in source_candidates for m in row_moods(row)},
+        key=lambda x: display_mood(x).casefold(),
+    )
 
     if not genres:
         print(
@@ -2963,17 +3133,11 @@ async def create_playlist(
         "Mood",
     )
 
-    if source_filter:
-        candidates = [
-            row for row in source_candidates
-            if (genre is None or genre in row_genres(row))
-            and (mood is None or mood in row_moods(row))
-        ]
-    else:
-        candidates = get_candidate_tracks(
-            genre,
-            mood,
-        )
+    candidates = [
+        row for row in source_candidates
+        if (genre is None or genre in row_genres(row))
+        and (mood is None or mood in row_moods(row))
+    ]
 
     print()
     print(
@@ -3055,30 +3219,87 @@ async def create_playlist(
             *(download_one(index, item) for index, item in enumerate(items, 1)),
             return_exceptions=True,
         )
-        failures = [(items[index], result) for index, result in enumerate(results) if isinstance(result, Exception)]
+        failures = [(index, result) for index, result in enumerate(results) if isinstance(result, Exception)]
         if failures:
-            # Keep successful downloads visible in this playlist's package even if
-            # another track fails. Previously this early return skipped copying
-            # every successful file into playlist_dir/tracks.
-            copy_playlist_tracks(items, playlist_dir)
-            error_lines = [
-                "일부 음원 다운로드에 실패하여 합본 MP3는 생성하지 않았습니다.",
-                "성공한 음원은 tracks 폴더에 복사했습니다.",
-                "",
-            ]
-            for failed_item, error in failures:
-                message = f"{failed_item.get('artist', 'Unknown')} - {failed_item.get('title', 'Unknown')}: {error}"
-                print(f"❌ 외부 음원 다운로드 실패: {message}")
-                error_lines.append(message)
+            # Replace failed Openverse URLs with alternate candidates of the same
+            # selected genre/mood, preferring similar durations. Never leave a
+            # known 403, missing, tiny, or corrupt file in the final playlist.
+            used_ids = {item["track_id"] for item in items}
+            attempted_replacements = set(used_ids)
+            error_lines = ["Openverse 다운로드 실패 및 대체 기록", ""]
+            for failed_index, first_error in failures:
+                failed_item = items[failed_index]
+                if failed_item.get("source", "").lower() != "openverse":
+                    error_lines.append(f"대체 미실행: {failed_item['title']} ({first_error})")
+                    continue
+                alternatives = [
+                    row for row in candidates
+                    if row["track_id"] not in attempted_replacements
+                    and row["track_id"] not in used_ids
+                    and row["track_id"] != failed_item["track_id"]
+                    and (not source_filter or (row["external_source"] if "external_source" in row.keys() else "") == source_filter)
+                ]
+                alternatives.sort(key=lambda row: abs(int(row["duration"] or 0) - int(failed_item["duration"] or 0)))
+                replacement_ok = False
+                last_error = first_error
+                for alt in alternatives[:8]:
+                    alt_item = build_playlist_items([alt])[0]
+                    alt_item["position"] = failed_item["position"]
+                    alt_item["start_seconds"] = failed_item["start_seconds"]
+                    alt_item["timestamp"] = failed_item["timestamp"]
+                    attempted_replacements.add(alt_item["track_id"])
+                    print(f"\n🔁 대체 곡 시도: {failed_item['title']} → {alt_item['title']}")
+                    try:
+                        await ensure_downloaded(client, captured, alt_item)
+                    except Exception as exc:
+                        last_error = exc
+                        error_lines.append(f"대체 실패: {alt_item['artist']} - {alt_item['title']}: {exc}")
+                        continue
+                    items[failed_index] = alt_item
+                    used_ids.add(alt_item["track_id"])
+                    used_ids.discard(failed_item["track_id"])
+                    error_lines.append(f"대체 성공: {failed_item['title']} → {alt_item['title']}")
+                    replacement_ok = True
+                    break
+                if not replacement_ok:
+                    error_lines.append(f"대체 곡을 찾지 못함: {failed_item['artist']} - {failed_item['title']}: {last_error}")
+
+            # Recalculate timestamps after replacement, because replacement tracks
+            # may have slightly different durations.
+            cursor = 0
+            for position, item in enumerate(items, 1):
+                item["position"] = position
+                item["start_seconds"] = cursor
+                item["timestamp"] = format_time(cursor)
+                cursor += int(item["duration"] or 0)
+
+            remaining_failures = [item for item in items if not item.get("file_path") or not Path(item["file_path"]).is_file()]
+            if remaining_failures:
+                copy_playlist_tracks(items, playlist_dir)
+                error_path = playlist_dir / "download_errors.txt"
+                error_path.write_text("\n".join(error_lines) + "\n", encoding="utf-8")
+                successful_count = len(items) - len(remaining_failures)
+                print(f"\n⚠️ 대체 후 다운로드 성공: {successful_count}/{len(items)}곡")
+                print(f"성공한 개별 음원: {playlist_dir / 'tracks'}")
+                print(f"실패 기록: {error_path}")
+                print("일부 곡을 받지 못해 합본 MP3는 생성하지 않았습니다.")
+                return
             error_path = playlist_dir / "download_errors.txt"
             error_path.write_text("\n".join(error_lines) + "\n", encoding="utf-8")
-            successful_count = sum(1 for item in items if item.get("file_path") and Path(item["file_path"]).is_file())
-            print(f"\n⚠️ 다운로드 성공: {successful_count}/{len(items)}곡")
-            print(f"성공한 개별 음원 폴더: {playlist_dir / 'tracks'}")
-            print(f"실패 기록: {error_path}")
-            print("합본 MP3는 생성하지 않았습니다. 실패한 곡을 제외하거나 다시 시도하세요.")
-            return
+            print(f"\n✅ 다운로드 실패 곡을 대체했습니다. 기록: {error_path}")
     else:
+        # Defense-in-depth: menu 1 must never download external/local tracks.
+        unexpected = [
+            item for item in items
+            if item.get("source") != "YouTube Audio Library"
+        ]
+        if unexpected:
+            print("\n❌ 소스 경계 검사 실패: 메뉴 1에는 YouTube Audio Library 음원만 허용됩니다.")
+            print("외부 음원 다운로드를 시작하지 않았습니다. 후보 선택을 확인해 주세요.")
+            for item in unexpected[:5]:
+                print(f" - {item.get('source')}: {item.get('artist')} - {item.get('title')}")
+            return
+
         for index, item in enumerate(items, 1):
             print(f"\n[{index}/{len(items)}]")
             await ensure_downloaded(client, captured, item)
@@ -3227,20 +3448,25 @@ def get_external_sources():
 
 def choose_external_source():
     sources = get_external_sources()
-    if not sources:
-        print("외부 플레이리스트 후보가 없습니다. 메뉴 9에서 카탈로그를 업데이트하세요.")
-        return None
-    options = ["모든 외부 사이트"] + sources
+    # Pixabay is a direct search/download provider, not a metadata catalog provider.
+    options = ["모든 외부 사이트"] + sources + ["Pixabay 음악 검색/일괄 다운로드"]
     print("\n외부 음원 소스 선택")
     for index, value in enumerate(options, 1):
-        label = "모든 외부 사이트" if value == "모든 외부 사이트" else value.capitalize()
+        if value == "모든 외부 사이트":
+            label = value
+        elif value == "Pixabay 음악 검색/일괄 다운로드":
+            label = value
+        else:
+            label = value.capitalize()
         print(f"{index:2}. {label}")
     while True:
         choice = input("\n소스 번호: ").strip()
         try:
             index = int(choice)
             if 1 <= index <= len(options):
-                return "external" if index == 1 else options[index - 1]
+                if index == 1:
+                    return "external"
+                return "pixabay" if options[index - 1] == "Pixabay 음악 검색/일괄 다운로드" else options[index - 1]
         except ValueError:
             pass
         print("올바른 번호를 입력하세요.")
@@ -3248,6 +3474,352 @@ def choose_external_source():
 
 # ============================================================
 # MAIN
+# ============================================================
+# LOCAL MUSIC LIBRARY (user-downloaded, license-cleared audio only)
+# ============================================================
+
+LOCAL_MUSIC_DIR = BASE_DIR / "music_library"
+LOCAL_CATALOG_PATH = LOCAL_MUSIC_DIR / "catalog.json"
+LOCAL_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
+
+
+def _local_file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _local_audio_tags(path: Path) -> tuple[str, str]:
+    """Read artist/title tags with ffprobe when available; fall back to filename."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        ffmpeg_path = get_ffmpeg_path()
+        if ffmpeg_path:
+            candidate = Path(ffmpeg_path).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+            if candidate.exists():
+                ffprobe = str(candidate)
+    if ffprobe:
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format_tags=title,artist,album_artist",
+                 "-of", "json", str(path)],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                tags = json.loads(result.stdout).get("format", {}).get("tags", {})
+                tags = {str(k).casefold(): str(v).strip() for k, v in tags.items()}
+                title = tags.get("title", "").strip()
+                artist = (tags.get("artist") or tags.get("album_artist") or "").strip()
+                if title:
+                    return artist or "Unknown Artist", title
+        except (OSError, ValueError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass
+    stem = path.stem.strip()
+    # Pixabay downloader filenames carry the stable track ID to prevent overwrites.
+    # Keep the track title readable when no embedded ID3 tags are available.
+    pixabay_match = re.match(r"^pixabay_\d+_(.+)$", stem, flags=re.IGNORECASE)
+    if pixabay_match:
+        return "Pixabay", pixabay_match.group(1).replace("_", " ").strip()
+    # Common manually downloaded filename pattern: "Artist - Track title.mp3".
+    parts = re.split(r"\s+-\s+", stem, maxsplit=1)
+    if len(parts) == 2 and all(parts):
+        return parts[0].strip(), parts[1].strip()
+    return "Local Library", stem or path.name
+
+
+def _used_key(value: str) -> str:
+    return "".join(ch for ch in normalize_text(value).casefold() if ch.isalnum())
+
+
+def _read_used_keys(used_file: Path | None = None) -> tuple[set[str], set[str]]:
+    used_file = used_file or USED_FILE
+    combined, title_only = set(), set()
+    if not used_file.is_file():
+        return combined, title_only
+    try:
+        lines = used_file.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        print(f"⚠️ used.txt를 읽을 수 없습니다: {exc}")
+        return combined, title_only
+    for line in lines:
+        value = normalize_text(line)
+        if not value or value.startswith("#"):
+            continue
+        combined.add(_used_key(value))
+        if " - " not in value:
+            title_only.add(_used_key(value))
+    return combined, title_only
+
+
+def scan_local_library(library_dir: Path | None = None, *, write_catalog: bool = True) -> list[dict]:
+    """Index audio already present in music_library; does not download or scrape anything."""
+    library_dir = Path(library_dir or LOCAL_MUSIC_DIR)
+    library_dir.mkdir(parents=True, exist_ok=True)
+    tracks = []
+    seen_hashes = set()
+    seen_recordings = set()
+    skipped = 0
+    for path in sorted(library_dir.rglob("*"), key=lambda item: str(item).casefold()):
+        if not path.is_file() or path.suffix.casefold() not in LOCAL_AUDIO_EXTENSIONS:
+            continue
+        if any(part.startswith(".") for part in path.relative_to(library_dir).parts):
+            continue
+        try:
+            duration_value = _probe_audio_duration_seconds(path)
+            if duration_value is None or duration_value <= 0:
+                skipped += 1
+                continue
+            duration = max(1, int(round(duration_value)))
+            artist, title = _local_audio_tags(path)
+            content_hash = _local_file_hash(path)
+            identity = _used_key(f"{artist} {title}")
+            if content_hash in seen_hashes or (identity and identity in seen_recordings):
+                continue
+            seen_hashes.add(content_hash)
+            if identity:
+                seen_recordings.add(identity)
+            tracks.append({
+                "track_id": f"local:{content_hash}",
+                "title": title,
+                "artist": artist,
+                "duration": duration,
+                "genres": "[]",
+                "moods": "[]",
+                "external_source": "local",
+                "local_file_path": str(path.resolve()),
+                "downloaded_file": str(path.resolve()),
+                "file_path": str(path.resolve()),
+                "relative_path": str(path.relative_to(library_dir)),
+                "sha256": content_hash,
+                "size_bytes": path.stat().st_size,
+                "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+                "source": "Local Library",
+            })
+        except (OSError, ValueError) as exc:
+            skipped += 1
+            print(f"⚠️ 음원 분석 실패, 건너뜀: {path.name} ({exc})")
+    if write_catalog:
+        catalog = {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "library_dir": str(library_dir.resolve()),
+            "track_count": len(tracks),
+            "tracks": tracks,
+        }
+        catalog_path = library_dir / "catalog.json"
+        catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+    if skipped:
+        print(f"⚠️ 길이를 확인할 수 없거나 읽을 수 없는 파일: {skipped}개")
+    return tracks
+
+
+def _merge_local_tracks_with_ffmpeg(items, output_path: Path) -> Path | None:
+    """Re-encode mixed audio formats to MP3; safer than concat-demuxing mixed codecs."""
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg:
+        print("❌ FFmpeg를 찾지 못했습니다. FFmpeg를 설치하거나 FFMPEG_BIN을 설정하세요.")
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    inputs = []
+    filter_parts = []
+    for index, item in enumerate(items):
+        audio_path = Path(item["file_path"])
+        if not audio_path.is_file():
+            print(f"❌ 원본 음원 파일이 없습니다: {audio_path}")
+            return None
+        inputs.extend(["-i", str(audio_path)])
+        filter_parts.append(f"[{index}:a:0]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]")
+    concat_inputs = "".join(f"[a{index}]" for index in range(len(items)))
+    filter_parts.append(f"{concat_inputs}concat=n={len(items)}:v=0:a=1[outa]")
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", *inputs,
+               "-filter_complex", ";".join(filter_parts), "-map", "[outa]",
+               "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-id3v2_version", "3",
+               "-metadata", "title=Local Music Playlist", "-y", str(output_path)]
+    print("🎧 로컬 음원을 통합 MP3로 변환 중...")
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=1800, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"❌ MP3 생성 실패: {exc}")
+        return None
+    if result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
+        print("❌ MP3 생성에 실패했습니다.")
+        if result.stderr:
+            print(result.stderr[-4000:])
+        output_path.unlink(missing_ok=True)
+        return None
+    return output_path
+
+
+def _write_local_playlist_outputs(items, target_seconds: int, output_dir: Path, merged_path: Path | None) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total = sum(int(item["duration"]) for item in items)
+    lines = [
+        "Local Music Library Playlist",
+        f"Target duration: {format_time(target_seconds)}",
+        f"Selected duration: {format_time(total)}",
+        f"Difference: {format_time(max(0, target_seconds - total))}",
+        f"Tracks: {len(items)}",
+        "",
+    ]
+    timeline_lines = ["Position | Start | End | Duration | Artist - Title | Source file"]
+    start = 0
+    for position, item in enumerate(items, 1):
+        end = start + int(item["duration"])
+        item["position"] = position
+        item["start_seconds"] = start
+        item["end_seconds"] = end
+        item["timestamp"] = format_time(start)
+        item["end_timestamp"] = format_time(end)
+        lines.append(f"{position:02d}. {format_time(start)}  {item['artist']} - {item['title']} ({format_time(item['duration'])})")
+        timeline_lines.append(f"{position:02d} | {format_time(start)} | {format_time(end)} | {format_time(item['duration'])} | {item['artist']} - {item['title']} | {item['file_path']}")
+        start = end
+    if merged_path:
+        lines.extend(["", f"Merged MP3: {merged_path.name}"])
+    (output_dir / "playlist.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (output_dir / "timeline.txt").write_text("\n".join(timeline_lines) + "\n", encoding="utf-8")
+    with (output_dir / "timeline.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["position", "start", "end", "duration_seconds", "artist", "title", "file_path"])
+        for item in items:
+            writer.writerow([item["position"], item["timestamp"], item["end_timestamp"], item["duration"], item["artist"], item["title"], item["file_path"]])
+    manifest = {
+        "source": "Local Music Library",
+        "target_duration_seconds": target_seconds,
+        "music_duration_seconds": total,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "merged_mp3": str(merged_path) if merged_path else None,
+        "items": items,
+    }
+    (output_dir / "playlist.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _record_local_usage(items) -> None:
+    USED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    existing, _ = _read_used_keys()
+    to_add = []
+    for item in items:
+        entry = f"{item['artist']} - {item['title']}"
+        key = _used_key(entry)
+        if key not in existing:
+            to_add.append(entry)
+            existing.add(key)
+    if to_add:
+        with USED_FILE.open("a", encoding="utf-8", newline="") as stream:
+            for entry in to_add:
+                stream.write(entry + "\n")
+    conn = db()
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        for item in items:
+            conn.execute("""
+                INSERT INTO track_usage(track_id, use_count, first_used_at, last_used_at)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT(track_id) DO UPDATE SET
+                    use_count=track_usage.use_count + 1,
+                    last_used_at=excluded.last_used_at
+            """, (item["track_id"], now, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_local_library_playlist() -> None:
+    print("\n[로컬 음원 플레이리스트]")
+    print(f"음원 폴더: {LOCAL_MUSIC_DIR}")
+    try:
+        raw_target = input("목표 길이 입력 (예: 45, 45:00, 01:15:00): ").strip()
+        target_seconds = parse_duration(raw_target)
+        if target_seconds <= 0 or target_seconds > 24 * 3600:
+            raise ValueError
+    except (ValueError, TypeError):
+        print("❌ 길이 형식이 올바르지 않습니다. 예: 45 또는 45:00 또는 01:15:00")
+        return
+
+    tracks = scan_local_library()
+    if not tracks:
+        print(f"❌ 분석 가능한 음원이 없습니다. 음원을 {LOCAL_MUSIC_DIR}에 넣고 FFmpeg/ffprobe 설치를 확인하세요.")
+        return
+    used_combined, used_titles = _read_used_keys()
+    candidates = []
+    skipped_used = 0
+    for track in tracks:
+        combined_key = _used_key(f"{track['artist']} - {track['title']}")
+        title_key = _used_key(track["title"])
+        if combined_key in used_combined or title_key in used_titles:
+            skipped_used += 1
+            continue
+        candidates.append(track)
+    print(f"라이브러리: {len(tracks)}곡 / used.txt로 제외: {skipped_used}곡 / 신규 후보: {len(candidates)}곡")
+    if not candidates:
+        print("❌ 사용 이력에 없는 음원이 없습니다. used.txt를 확인하거나 새 음원을 추가하세요.")
+        return
+
+    # Local playlists may need more than the default 12 tracks for longer videos.
+    global MAX_TRACKS_PER_PLAYLIST
+    original_max_tracks = MAX_TRACKS_PER_PLAYLIST
+    shortest = min(int(track["duration"]) for track in candidates)
+    needed = (target_seconds + shortest - 1) // shortest + 1
+    MAX_TRACKS_PER_PLAYLIST = min(len(candidates), max(original_max_tracks, needed))
+    try:
+        selected = find_best_playlist(candidates, target_seconds)
+    finally:
+        MAX_TRACKS_PER_PLAYLIST = original_max_tracks
+    if not selected:
+        print("❌ 목표 길이에 맞는 조합을 만들지 못했습니다. 더 많은 음원을 추가하거나 목표 길이를 줄여주세요.")
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = PLAYLIST_DIR / f"local_{stamp}"
+    merged_path = output_dir / "merged_playlist.mp3"
+    items = []
+    elapsed = 0
+    for index, row in enumerate(selected, 1):
+        duration = int(row["duration"])
+        items.append({
+            "position": index,
+            "track_id": row["track_id"],
+            "title": row["title"],
+            "artist": row["artist"],
+            "duration": duration,
+            "start_seconds": elapsed,
+            "timestamp": format_time(elapsed),
+            "file_path": row["file_path"],
+            "genre": "Local Library",
+            "mood": "Unknown",
+            "source": "Local Music Library",
+            "source_url": "",
+            "license_url": "",
+        })
+        elapsed += duration
+
+    actual_merged_path = _merge_local_tracks_with_ffmpeg(items, merged_path)
+    _write_local_playlist_outputs(items, target_seconds, output_dir, actual_merged_path)
+    if actual_merged_path:
+        _record_local_usage(items)
+        # Keep the normal database playlist history without modifying existing records.
+        conn = db()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO playlist_history(video_title, video_duration, music_duration, created_at) VALUES (?, ?, ?, ?)",
+                (f"Local Music Playlist {stamp}", target_seconds, elapsed, datetime.now().isoformat(timespec="seconds")),
+            )
+            playlist_id = cursor.lastrowid
+            for item in items:
+                conn.execute(
+                    "INSERT INTO playlist_items(playlist_id, track_id, position, start_seconds, duration, title, artist, file_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (playlist_id, item["track_id"], item["position"], item["start_seconds"], item["duration"], item["title"], item["artist"], item["file_path"]),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        print("✅ MP3, 플레이리스트 목록, 타임라인 생성 완료. 사용 이력을 used.txt와 DB에 기록했습니다.")
+    else:
+        print("⚠️ 목록과 타임라인은 저장했지만 MP3 생성이 실패해 사용 이력은 변경하지 않았습니다.")
+    print(f"출력 폴더: {output_dir}")
+    print(f"선택 곡: {len(items)}곡 / 음악 길이: {format_time(elapsed)} / 목표 길이: {format_time(target_seconds)}")
+
+
 # ============================================================
 
 async def main():
@@ -3387,6 +3959,14 @@ async def main():
                 )
 
                 print(
+                    "11. 로컬 음원 라이브러리 스캔/카탈로그 갱신"
+                )
+
+                print(
+                    "12. 로컬 음원으로 플레이리스트 + 타임라인 + 통합 MP3 생성"
+                )
+
+                print(
                     "0. 종료"
                 )
 
@@ -3490,12 +4070,27 @@ async def main():
                 elif choice == "10":
 
                     source_filter = choose_external_source()
-                    if source_filter:
+                    if source_filter == "pixabay":
+                        from pixabay_music_downloader import run_pixabay_download_flow
+                        run_pixabay_download_flow(LOCAL_MUSIC_DIR)
+                    elif source_filter:
                         await create_playlist(
                             client,
                             None,
                             source_filter=source_filter,
                         )
+
+                elif choice == "11":
+
+                    print(f"\n로컬 음원 폴더: {LOCAL_MUSIC_DIR}")
+                    indexed = scan_local_library()
+                    print(f"카탈로그 갱신 완료: {len(indexed)}곡")
+                    print(f"카탈로그 파일: {LOCAL_CATALOG_PATH}")
+                    print("Pixabay 등 외부 사이트에서 직접 허용된 방식으로 내려받은 파일만 이 폴더에 넣으세요.")
+
+                elif choice == "12":
+
+                    create_local_library_playlist()
 
                 elif choice == "0":
 
