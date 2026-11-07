@@ -113,10 +113,11 @@ def _print_playlist(settings: Settings, db: Database, p: Playlist) -> None:
     for n, (start, item) in enumerate(p.timeline(xf), 1):
         track = db.get(item.track_id)
         vocals = track.vocals if track else "?"
+        duration = trim if n == len(p.items) and trim else item.duration
         label = f"{item.artist + ' - ' if item.artist else ''}{item.title}"
         lock = "🔒" if item.locked else "  "
         print(
-            f"{n:>2}  {fmt_time(start):>7}  {fmt_time(item.duration):>6}  {label[:46]:<48} "
+            f"{n:>2}  {fmt_time(start):>7}  {fmt_time(duration):>6}  {label[:46]:<48} "
             f"{item.source:<9} {item.license:<16} {vocals} {lock}"
         )
     credits = p.credits()
