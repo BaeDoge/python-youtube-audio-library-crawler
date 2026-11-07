@@ -1,94 +1,118 @@
-# music-crawler
+# Music Library
 
-잔잔한 연주곡(jazz · new age · classical · calm)을 라이선스 걱정 없이 모아서, **원하는 길이의 배경음악 mp3 하나**와 **유튜브 설명란 텍스트(곡 목록 + 크레딧)** 를 자동으로 만들어 주는 도구입니다.
+외부 무료 음원 카탈로그와 직접 보유한 음원을 한 곳에서 관리하고, 원하는 길이의 배경음악 파일로 구성하는 개인용 음원 라이브러리입니다.
 
-*English: collects license-safe calm/instrumental music from Jamendo, Openverse, YouTube Audio Library and your own folder, then builds a fixed-length, crossfaded, loudness-normalised background-music mix with a ready-to-paste video description.*
+주요 기능은 음원 수집, 장르·무드별 분류, 목표 길이에 맞춘 믹스 생성, 구간별 타임라인 출력, 제외곡 관리입니다. 믹스 생성과 편집 외의 쇼츠 보조 기능은 포함하지 않습니다.
 
-## 빠른 시작
+## 1. 준비
 
-```bash
-pip install -e .                  # 필요: Python 3.11+, ffmpeg(+ffprobe)
-music-crawler init                # data/ library/ output/ 와 .env 생성
-# .env 에 JAMENDO_CLIENT_ID 입력 (https://devportal.jamendo.com/)
-music-crawler doctor              # 환경 점검
-music-crawler sync                # Jamendo + Openverse + 내 폴더 수집
-music-crawler stats               # 후보 풀: 장르/mood/보컬/라이선스별 곡 수, 만들 수 있는 플레이리스트 수
-music-crawler make 60 --genre jazz,newage,classic --mood calm   # 60분 믹스 생성
-```
-
-`mc` 는 `music-crawler` 의 짧은 별칭입니다. YouTube 오디오 라이브러리까지 쓰려면 `pip install -e ".[youtube]"`.
-
-## 작업 흐름
-
-| 단계 | 명령 | 설명 |
-|---|---|---|
-| 수집 | `sync [jamendo\|openverse\|local\|youtube]` | 메타데이터만 수집. 제외된 곡은 **사유별 개수**를 보여줍니다. Jamendo 는 **이어서 진행**(아래) |
-| 현황 | `stats --genre … --mood …` | 조건에 맞는 풀 크기와 "60분짜리 N개 가능" |
-| 생성 | `make 60 …` | 곡 선택 → 다운로드 → 크로스페이드·음량 정규화 → `mix.mp3` |
-| 편집 | `show`, `remove 3 5`, `add "검색어/id"`, `fill` | 삭제하면 목표 길이로 자동 재충전 (삭제한 곡은 다시 안 들어옴) |
-| 재생성 | `render` | 편집 내용 반영 |
-| 확정 | `commit` | 사용 처리 → 다음 영상에서는 제외 |
-| 기타 | `ban`, `search`, `migrate-legacy` | 영구 제외 / 검색 / 이전 프로젝트 가져오기 |
-
-길이는 `60`(분), `45:00`, `1:15:00` 형식. 기본은 마지막 곡을 페이드아웃으로 잘라 **정확히 그 길이**에 맞추고(`--no-exact` 로 끔), 곡 사이는 3초 크로스페이드, 곡 간 음량은 loudnorm 으로 맞춥니다.
-
-결과: `output/playlists/<날짜_이름>/`
-
-* `mix.mp3` — 합쳐진 최종 음원
-* `tracks/01 - 아티스트 - 제목.mp3 …` — **곡별 개별 파일**. 번호가 `show`/`remove` 번호와 같아서, 들어 보고 별로인 곡을 `remove 3` 으로 뺄 수 있습니다 (`COPY_TRACKS=false` 로 끔)
-* `playlist.m3u8` — 곡별 파일을 플레이어에서 한 번에 열기
-* `description.txt`(타임스탬프 + CC BY 크레딧), `timeline.csv`, `credits.txt`, `playlist.json`
-
-곡을 빼거나 넣은 뒤에는 `render` 를 다시 실행하면 `mix.mp3` 와 `tracks/` 가 새로 만들어집니다.
-
-## Jamendo 수집은 이어서 진행됩니다
-
-태그별 인기순 위치(커서)를 DB 에 저장해서, `sync jamendo` 를 다시 실행하면 **지난번 끝난 지점부터** 태그당 `--per-tag`(기본 400)곡을 더 확인합니다. 실행 비용이 카탈로그 크기와 무관하게 일정합니다. 매 실행마다 태그별 최신 등록곡 400개도 다시 확인해 새로 올라온 곡을 놓치지 않습니다.
-
-* `sync jamendo --all` — 모든 태그를 끝까지 (중간에 Ctrl+C 해도 다음에 이어서)
-* `sync jamendo --reset` — 위치를 지우고 처음부터
-
-## 장르 고르기
-
-* 기본값(`--genre` 생략)은 `relax` 프로필의 장르(Jazz, NewAge, Classical, Ambient, Piano, Acoustic, Lounge)와 mood(calm 계열)입니다.
-* 다른 장르: `make 60 --genre rock --mood all` (프로필 mood 도 풀려면 `--mood all`).
-* 장르 목록: Jazz NewAge Classical Ambient Piano Acoustic Lounge Lofi Cinematic Folk Blues Electronic Rock Pop HipHop RnB Reggae World Kids Holiday. mood: calm peaceful warm dreamy romantic melancholy uplifting dramatic dark energetic.
-* 랜덤 장르: `make 60 --genre random`(곡이 충분한 장르 1개) / `--genre random:2`(2개 섞기). `--seed` 로 재현.
-* 장르 풀 확인: `stats --genre all --mood all`.
-* 새 장르를 **수집**하려면 `config/profiles.toml` 에 프로필을 만들고 `sync --profile 이름` (예시: `config/profiles.example.toml`). YouTube 오디오 라이브러리는 이미 전 장르 메타데이터를 가지고 있어 수집 없이 `--genre` 만 바꾸면 됩니다.
-
-## 필터
-
-* `--genre jazz,newage,classic` — 별칭 허용(classic→Classical). `all` 은 제한 없음.
-* `--mood calm,peaceful` — mood 라벨이 없는 곡은 우선순위가 낮아질 뿐 제외되지는 않음. 완전 제외는 `--strict-mood`.
-* `--vocals lenient`(기본, 보컬 확정곡만 제외) / `strict`(연주곡 확정만) / `any`.
-  Jamendo 는 곡마다 보컬/연주 플래그가 있지만 **YouTube 오디오 라이브러리와 Openverse 는 없어서** `unknown` 으로 남습니다. `strict` 는 사실상 Jamendo 위주가 됩니다.
-* 나만의 프로필: `config/profiles.example.toml` 참고.
-
-## 내가 직접 받은 음원 (Pixabay 등)
-
-`library/inbox/` 에 넣고 `music-crawler sync local`. 폴더명이 힌트가 됩니다: `inbox/Jazz/Calm/곡.mp3`. `inbox/pixabay/` 아래는 Pixabay 라이선스로 표시됩니다. 곡 옆에 같은 이름의 `.json`(title, artist, license, license_url, source_url …)을 두면 우선 적용됩니다. CC BY-NC 같은 비허용 라이선스는 자동으로 제외됩니다. 이 프로젝트는 Pixabay 를 자동 수집하지 않습니다 → [docs/SOURCES.md](docs/SOURCES.md).
-
-## 이전 프로젝트에서 옮기기
+필수 환경은 Python 3.11 이상과 `ffmpeg`, `ffprobe`입니다.
 
 ```bash
-music-crawler migrate-legacy /path/to/old/project
+uv sync
+uv run music-crawler init
+uv run music-crawler doctor
 ```
 
-`tracks.db`, `used.txt`, 다운로드한 파일, 사용 이력을 새 구조로 가져오고 라이선스/mood 를 새 규칙으로 다시 계산합니다.
+플랫폼을 사용할 때만 `.env`에 해당 인증 정보를 입력합니다.
 
-## 폴더 구조
+- Jamendo: `JAMENDO_CLIENT_ID`
+- Openverse: 인증 정보 없이도 제한적으로 동작하며, 더 높은 한도가 필요하면 `OPENVERSE_CLIENT_ID`, `OPENVERSE_CLIENT_SECRET`
+- YouTube Audio Library: `pip install -e ".[youtube]"`, 로그인된 Chrome 원격 디버깅 세션 및 `YOUTUBE_CHANNEL_ID`
 
+## 2. 폴더 사용법
+
+`music-crawler init` 실행 후 생성되는 런타임 폴더만 사용하면 됩니다.
+
+```text
+workspace/
+├── .env                       # 선택 플랫폼의 인증 정보
+├── config/
+│   └── profiles.toml          # 선택 수집 프로필(선택)
+├── data/
+│   └── music.db               # 곡 메타데이터, 사용 목록, ban 목록
+├── library/
+│   ├── inbox/                 # 직접 받은 음원을 넣는 곳
+│   │   └── Jazz/Calm/song.mp3
+│   ├── jamendo/               # 플랫폼에서 받은 음원
+│   ├── openverse/
+│   └── youtube/
+└── output/
+    └── playlists/             # 통합 음원과 구간 정보
 ```
-src/music_crawler/   cli, config, db, taxonomy, selector, playlist, audio, downloader, providers/
-tests/               pytest (ffmpeg 필요한 e2e 포함)
-docs/                ARCHITECTURE.md, SOURCES.md
-config/              profiles.example.toml
-scripts/             chrome_debug.bat (YouTube 오디오 라이브러리용)
-tools/shorts/        음악과 무관한 쇼츠 보조 스크립트
-data/ library/ output/   ← 런타임 데이터, git 에 올라가지 않음
+
+직접 받은 곡은 `library/inbox/<장르>/<무드>/`에 넣습니다. 예를 들어 `library/inbox/Jazz/Calm/song.mp3`처럼 저장하면 폴더명을 장르와 무드 분류 힌트로 사용합니다. 파일 옆에 같은 이름의 JSON sidecar를 두면 제목, 아티스트, 라이선스, 출처 URL을 직접 지정할 수 있습니다.
+
+## 3. 믹스 생성 방식 선택
+
+### 보유 음원만 사용
+
+외부 사이트를 조회하지 않고 `library/inbox`에 직접 넣은 음원만 사용합니다.
+
+```bash
+uv run music-crawler make 60 --genre jazz,newage --mood calm --library-only
 ```
 
-## 주의
+### 외부 플랫폼을 선택해 자동 확장
 
-라이선스 자동 필터는 위험을 줄일 뿐 권리를 보증하지 않습니다. 게시 전 [docs/SOURCES.md](docs/SOURCES.md) 를 읽고, CC BY 곡은 `description.txt` 의 크레딧을 설명란에 넣으세요.
+우선 현재 라이브러리에서 곡을 고릅니다. 목표 길이에 부족할 때 지정한 플랫폼을 추가 조회하고, 새 후보를 반영해 길이를 다시 채웁니다. 실제 선택된 곡은 믹스 렌더링 단계에서 자동 다운로드됩니다.
+
+```bash
+uv run music-crawler make 60 --genre jazz,newage --mood calm --download-from jamendo,openverse
+uv run music-crawler make 30 --genre piano,ambient --mood dreamy --download-from youtube
+```
+
+지원 플랫폼은 `jamendo`, `openverse`, `youtube`입니다. 여러 플랫폼은 쉼표로 구분합니다. YouTube는 로그인된 Chrome 세션이 필요합니다. 인증 정보가 없는 플랫폼이나 수집에 실패한 플랫폼은 경고를 남기고 다음 플랫폼을 계속 시도합니다.
+
+무드 후보가 충분하지 않으면 먼저 선택한 곡은 유지하면서 같은 장르·출처 조건 안에서 다른 무드의 곡을 추가해 길이를 보충합니다. 그래도 길이가 부족하면 가능한 곡만으로 믹스를 만들고 부족한 길이를 알려줍니다.
+
+`--download-from`과 `--library-only`는 함께 사용할 수 없습니다. 두 옵션을 생략하면 기존 DB 카탈로그를 사용합니다. DB에 저장된 외부 곡은 렌더링 시 파일이 없으면 다운로드합니다.
+
+## 4. 편집 및 확정
+
+```bash
+uv run music-crawler show
+uv run music-crawler remove 3 5       # 선택 곡 제거 + 자동 재충전 + 전역 BAN 등록
+uv run music-crawler render           # 편집 결과로 다시 생성
+uv run music-crawler commit           # 최종 사용 곡을 USED 목록에 등록
+uv run music-crawler lists            # BAN / USED 목록 확인
+uv run music-crawler unban jamendo:123 # BAN 해제
+```
+
+삭제한 곡은 기본적으로 전역 BAN 목록에 등록되어 이후 믹스에 다시 등장하지 않습니다. 현재 믹스에서만 제외하고 싶다면 `remove 3 --keep-eligible`를 사용합니다. 자동 재충전을 원하지 않으면 `--no-fill`을 추가할 수 있습니다.
+
+최종 믹스를 확인한 뒤 `commit`해야 해당 곡들이 USED 목록에 등록됩니다. USED 곡은 기본적으로 다음 믹스 후보에서 제외됩니다.
+
+## 5. 결과 파일
+
+`output/playlists/<날짜_이름>/`에 생성됩니다.
+
+- `mix.mp3`: 최종 통합 음원
+- `tracks/`: 번호가 붙은 개별 곡 파일
+- `playlist.m3u8`: 개별 곡 재생목록
+- `description.txt`: 유튜브 설명란에 넣을 수 있는 구간별 곡 목록과 크레딧
+- `timeline.csv`: 곡별 시작·종료 시각, 재생 길이(초), 출처 및 라이선스
+- `credits.txt`: 저작자 표시가 필요한 곡의 크레딧
+- `playlist.json`: 편집 가능한 플레이리스트 상태
+
+곡 사이는 크로스페이드로 자연스럽게 연결하고, 마지막 곡에는 길이 자르기 여부와 관계없이 약 5초 페이드아웃을 적용합니다. `--exact`가 기본 활성화되어 마지막 곡을 잘라 목표 길이에 맞춥니다.
+
+## 6. 라이브러리 관리
+
+```bash
+uv run music-crawler sync local
+uv run music-crawler sync jamendo
+uv run music-crawler sync openverse
+uv run music-crawler sync youtube
+uv run music-crawler stats --genre all --mood all
+uv run music-crawler search "검색어"
+uv run music-crawler ban jamendo:123
+uv run music-crawler unban jamendo:123
+uv run music-crawler lists
+```
+
+Jamendo는 태그별 커서를 저장해 다음 실행에서 이어서 수집합니다. 각 공급자는 라이선스, 오디오 길이, 보컬 정보 등을 확인해 후보에 등록합니다.
+
+## 라이선스 주의
+
+라이선스 자동 필터는 위험을 줄이는 보조 수단이지 사용 권리를 보증하지 않습니다. 게시 또는 수익화 전에 각 음원의 라이선스와 플랫폼 약관을 확인하세요. CC BY 등 저작자 표시가 필요한 음원은 생성된 `description.txt` 또는 `credits.txt`의 크레딧을 함께 사용해야 합니다. Jamendo API 및 YouTube Audio Library의 접근·사용 조건도 실제 사용 목적에 맞게 확인해야 합니다.

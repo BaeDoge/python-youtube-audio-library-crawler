@@ -152,8 +152,7 @@ class Playlist:
         self._invalidate()
 
     def _invalidate(self) -> None:
-        if self.status != "committed":
-            self.status = "draft"
+        self.status = "draft"
         self.outputs = {}
 
     def fill(
@@ -208,13 +207,17 @@ class Playlist:
         (folder / "description.txt").write_text(self.description(crossfade), encoding="utf-8")
         with (folder / "timeline.csv").open("w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["#", "start", "duration", "artist", "title", "source", "license"])
+            writer.writerow(["#", "start", "duration", "end", "duration_seconds", "artist", "title", "source", "license"])
+            trim = self.trim_for_exact(crossfade)
             for n, (start, item) in enumerate(self.timeline(crossfade), 1):
+                duration = trim if n == len(self.items) and trim else item.duration
                 writer.writerow(
                     [
                         n,
                         fmt_time(start),
-                        fmt_time(item.duration),
+                        fmt_time(duration),
+                        fmt_time(start + duration),
+                        int(round(duration)),
                         item.artist,
                         item.title,
                         item.source,

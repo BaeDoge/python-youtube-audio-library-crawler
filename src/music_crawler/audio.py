@@ -95,12 +95,18 @@ def build_filter(items: list[RenderItem], crossfade: float, normalize: bool) -> 
         if normalize:
             chain += ["loudnorm=I=-16:TP=-1.5:LRA=11", "aresample=44100"]
         if item.trim_to and item.trim_to < item.duration:
-            fade = min(5.0, item.trim_to / 4)
             chain += [
                 f"atrim=duration={item.trim_to:.3f}",
                 "asetpts=PTS-STARTPTS",
-                f"afade=t=out:st={item.trim_to - fade:.3f}:d={fade:.3f}",
             ]
+        if i == len(items) - 1:
+            # The final fade is independent from exact-duration trimming.
+            effective_duration = float(item.trim_to or item.duration)
+            fade = min(5.0, effective_duration / 4)
+            if fade > 0:
+                chain.append(
+                    f"afade=t=out:st={effective_duration - fade:.3f}:d={fade:.3f}"
+                )
         parts.append(f"[{i}:a]{','.join(chain)}[a{i}]")
     if len(items) == 1:
         parts.append("[a0]anull[out]")

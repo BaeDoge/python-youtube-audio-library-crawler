@@ -1,20 +1,39 @@
 # Architecture
 
 ```
-providers/ (jamendo, openverse, local, youtube_library)
-      │  parse → Track (canonical genre/mood/vocals/license)
-      ▼
-   db.py  (SQLite: tracks, usage, used_titles)   ◄── legacy.py (old tracks.db import)
-      │
-selector.py  filter → score → greedy fill → hill-climb to [target, target+tolerance]
-      │
-playlist.py  draft → remove/add/fill → render → commit      downloader.py (validated, atomic)
-      │                                                          │
-   audio.py  ffmpeg: loudnorm + acrossfade + optional exact trim ┘
+library/inbox + providers (Jamendo / Openverse / YouTube Audio Library)
+                    │
+                    ▼
+        provider adapters → canonical Track
+                    │
+                    ▼
+       SQLite (tracks / usage / sync cursors)
+                    │
+                    ▼
+      selector (genre / mood / license / usage)
+                    │
+        insufficient length?
+          ├─ selected online providers → sync → refill
+          └─ still short → relax mood → refill
+                    │
+                    ▼
+     playlist draft → remove / add / fill
+                    │
+                    ▼
+       validated downloads → ffmpeg render
+                    │
+                    ▼
+     mix.mp3 + timeline + credits + track files
+                    │
+                 commit
+                    ▼
+             persistent USED list
 ```
 
-* **Taxonomy (`taxonomy.py`)** maps every provider's labels onto one small vocabulary, so `--genre jazz --mood calm` works across sources.
-* **Sync never destroys state:** re-syncing updates metadata but keeps `status` (banned/invalid) and `file_path`.
-* **Failure policy:** permanent download failures (403/404/not audio) mark a track `invalid`; transient ones retry 3×.
-* **Adding a source:** write `providers/<name>.py` with `parse_track()` and `sync(settings, db, profile)` returning `SyncReport`, register it in `cli.cmd_sync`.
-* **Data lives outside git:** `data/`, `library/`, `output/`, `.env`.
+- **Providers** normalize metadata into one `Track` model. Local scans use folder names as classification hints; sidecar JSON can override descriptive and license metadata.
+- **Selection** excludes banned, invalid, already-used, and duplicate recordings. Mood is relaxed only after the requested pool and explicitly selected online providers cannot fill the target duration.
+- **Downloads** are validated before atomic placement in `library/<provider>/`. Invalid or permanently unavailable downloads are marked invalid.
+- **Editing** keeps removed IDs out of the current draft. By default, removing a track also records a persistent BAN status; `--keep-eligible` opts out of the global ban.
+- **Usage** is committed only after the user approves the generated mix. The usage table is the persistent USED list.
+- **Rendering** uses loudness normalization, short crossfades between tracks, optional exact final-track trim, and a final fade-out of approximately five seconds.
+- **Runtime data** (`.env`, `data/`, `library/`, `output/`) is excluded from git.
