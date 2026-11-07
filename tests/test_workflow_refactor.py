@@ -65,12 +65,12 @@ def test_remove_bans_track_by_default_and_can_be_reversed(settings, db):
 
 
 def test_make_relaxes_mood_only_after_requested_mood_is_short(settings, db):
-    calm = make_track(10, source="local", duration=80, moods=("calm",))
-    uplifting = make_track(11, source="local", duration=80, moods=("uplifting",))
+    calm = make_track(10, source="local", duration=120, moods=("calm",))
+    uplifting = make_track(11, source="local", duration=140, moods=("uplifting",))
     db.upsert_tracks([calm, uplifting])
 
     assert main([
-        "--home", str(settings.home), "make", "2",
+        "--home", str(settings.home), "make", "4",
         "--genre", "jazz", "--mood", "calm",
         "--library-only", "--no-render", "--seed", "7",
     ]) == 0
