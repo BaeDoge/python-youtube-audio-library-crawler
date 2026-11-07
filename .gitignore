@@ -9,3 +9,5 @@ backup/
 
 __pycache__/
 *.pyc
+
+music_library/
