@@ -343,7 +343,11 @@ class MusicLibraryApp:
         for source in online:
             if playlist.length(self.settings.crossfade_seconds) >= target:
                 break
-            _sync_online(source, self.settings, db, profile, log)
+            try:
+                _sync_online(source, self.settings, db, profile, log)
+            except Exception as exc:  # keep later selected platforms available
+                notes.append(f"{source} 자동 수집 실패: {exc}")
+                log(f"{source} 자동 수집 실패: {exc}")
             notes.extend(playlist.fill(self.settings, db, tolerance=120))
         if playlist.length(self.settings.crossfade_seconds) < target and criteria.moods:
             log("선택한 무드 음원이 부족해 같은 장르의 다른 무드 곡으로 보충합니다.")
@@ -435,7 +439,10 @@ class MusicLibraryApp:
                 for line in local_report.lines():
                     log(line)
                 for name in selected:
-                    _sync_online(name, self.settings, db, profile, log)
+                    try:
+                        _sync_online(name, self.settings, db, profile, log)
+                    except Exception as exc:  # one provider failure must not stop the others
+                        log(f"{name} 동기화 실패: {exc}")
         self._run_task("플랫폼 동기화", worker, lambda _result: self._library_done())
 
     def _library_done(self) -> None:
@@ -474,6 +481,8 @@ class MusicLibraryApp:
                         variable=self.ban_removed_var).pack(side="left", padx=(14, 0))
         ttk.Button(toolbar, text="선택 곡 제외 + 자동 채움 + 재생성",
                    style="Accent.TButton", command=self.remove_and_refill).pack(side="right")
+        ttk.Button(toolbar, text="이 믹스 사용 확정 (USED 등록)",
+                   command=self.commit_mix).pack(side="right", padx=(0, 8))
         add_row = ttk.Frame(self.content, style="App.TFrame")
         add_row.pack(fill="x", pady=(12, 0))
         ttk.Label(add_row, text="라이브러리에서 곡 추가").pack(side="left")
@@ -555,6 +564,32 @@ class MusicLibraryApp:
                 output = pl.render(self.settings, db, playlist, progress=log)
             return {"playlist": playlist, "output": output}
         self._run_task("믹스 수정 및 재생성", worker, self._edit_done)
+
+    def commit_mix(self) -> None:
+        try:
+            playlist = self._load_latest()
+        except FileNotFoundError as exc:
+            messagebox.showwarning("믹스 없음", str(exc), parent=self.root)
+            return
+        if playlist.status == "committed":
+            messagebox.showinfo("이미 확정됨", "이 믹스는 이미 USED 목록에 등록되어 있습니다.",
+                                parent=self.root)
+            return
+        prompt = (
+            f"현재 믹스의 {len(playlist.items)}곡을 USED 목록에 등록할까요?\\n"
+            "다음 믹스에서는 이 곡들이 기본적으로 제외됩니다."
+        )
+        if not messagebox.askyesno("사용 확정", prompt, parent=self.root):
+            return
+        from music_crawler import playlist as pl
+
+        with Database(self.settings.db_path) as db:
+            pl.commit(db, playlist, self.settings)
+        self.latest_playlist = playlist
+        self.refresh_edit()
+        self.refresh_summary()
+        messagebox.showinfo("확정 완료", "현재 믹스의 곡을 USED 목록에 등록했습니다.",
+                            parent=self.root)
 
     def add_track(self) -> None:
         query = self.add_track_var.get().strip()
