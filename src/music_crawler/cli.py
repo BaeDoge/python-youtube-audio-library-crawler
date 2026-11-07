@@ -545,6 +545,18 @@ def cmd_search(args, settings: Settings) -> int:
     return 0
 
 
+def cmd_menu(args, settings: Settings) -> int:
+    """Launch the optional Tkinter desktop menu without changing CLI workflows."""
+    try:
+        from music_crawler.gui import launch
+    except ImportError as exc:
+        raise SystemExit(
+            "데스크톱 메뉴를 불러오지 못했습니다. Python에 Tkinter가 포함되어 있는지 확인하세요."
+        ) from exc
+    launch(settings)
+    return 0
+
+
 def cmd_migrate(args, settings: Settings) -> int:
     with _open_db(settings) as db:
         try:
@@ -585,6 +597,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init", help="작업 폴더/.env 준비").set_defaults(func=cmd_init)
     sub.add_parser("doctor", help="환경 점검").set_defaults(func=cmd_doctor)
+    sub.add_parser("menu", aliases=["gui"], help="선택형 데스크톱 메뉴 열기").set_defaults(func=cmd_menu)
 
     p = sub.add_parser("stats", help="후보 풀 현황 (조건별 곡 수/시간)")
     _add_filters(p)
