@@ -2,7 +2,7 @@ from pathlib import Path
 
 from conftest import make_track
 
-from music_crawler import audio
+from music_crawler import audio, cli
 from music_crawler.cli import main
 from music_crawler.playlist import Item, Playlist
 from music_crawler.selector import Criteria
@@ -77,3 +77,11 @@ def test_make_relaxes_mood_only_after_requested_mood_is_short(settings, db):
     result = Playlist.load(settings, "latest")
     assert {item.track_id for item in result.items} == {calm.id, uplifting.id}
     assert result.criteria["moods"] == []
+
+
+
+def test_desktop_menu_command_is_registered_without_starting_tkinter():
+    args = cli.build_parser().parse_args(["menu"])
+    assert args.func is cli.cmd_menu
+    alias = cli.build_parser().parse_args(["gui"])
+    assert alias.func is cli.cmd_menu
