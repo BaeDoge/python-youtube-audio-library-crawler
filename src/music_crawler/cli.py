@@ -281,22 +281,75 @@ def pick_random_genres(
     return tuple(rng.sample(eligible, count))
 
 
+def _sync_make_source(name: str, settings: Settings, db: Database, profile) -> None:
+    """Fetch one explicitly selected online provider when the current pool is short."""
+    print("\n== 자동 확장: " + name + " ==")
+    if name == "jamendo":
+        if not settings.jamendo_client_id:
+            print("JAMENDO_CLIENT_ID가 없어 건너뜁니다.")
+            return
+        from music_crawler.providers import jamendo
+
+        report = jamendo.sync(settings, db, profile, per_tag_limit=400, progress=print)
+    elif name == "openverse":
+        from music_crawler.providers import openverse
+
+        report = openverse.sync(settings, db, profile, per_query_limit=240, progress=print)
+    elif name == "youtube":
+        from music_crawler.providers import youtube_library
+
+        report = youtube_library.sync(settings, db, profile, progress=print)
+    else:
+        raise ValueError(f"지원하지 않는 자동 수집 플랫폼: {name}")
+    print("\n".join(report.lines()))
+
+
 def cmd_make(args, settings: Settings) -> int:
     profiles = load_profiles(settings.profiles_file)
+    profile = profiles.get(args.profile)
+    if profile is None:
+        raise SystemExit(f"없는 프로필: {args.profile}")
+
+    download_from = _split(args.download_from)
+    supported_sources = {"jamendo", "openverse", "youtube"}
+    unknown = sorted(set(download_from) - supported_sources)
+    if unknown:
+        raise SystemExit(f"지원하지 않는 플랫폼: {', '.join(unknown)}")
+    if args.library_only and download_from:
+        raise SystemExit("--library-only 와 --download-from 은 함께 사용할 수 없습니다.")
+    if args.source and download_from:
+        raise SystemExit("--source 와 --download-from 중 하나만 지정하세요.")
+
     random_genres = re.fullmatch(r"random(?::(\d+))?", (args.genre or "").strip().lower())
     if random_genres:
-        args.genre = "all"  # pool = every genre; one is drawn below
+        args.genre = "all"
     criteria = build_criteria(args, settings, profiles)
-    if random_genres:
-        count = max(1, int(random_genres.group(1) or 1))
-        with _open_db(settings) as db:
-            pool = filter_candidates(db, criteria)
-        criteria = dataclasses.replace(
-            criteria, genres=pick_random_genres(pool, args.length, count, random.Random(args.seed))
-        )
-        print(f"랜덤 장르 선택: {', '.join(criteria.genres)}")
+    if args.library_only:
+        criteria = dataclasses.replace(criteria, sources=("local",))
+        print("음원 모드: 로컬 라이브러리만 사용 (외부 검색/다운로드 안 함)")
+    elif download_from:
+        criteria = dataclasses.replace(criteria, sources=tuple(dict.fromkeys(["local", *download_from])))
+        print(f"음원 모드: 로컬 라이브러리 + 선택 플랫폼 ({', '.join(download_from)})")
+    else:
+        print(f"음원 모드: 기존 카탈로그 ({', '.join(criteria.sources) if criteria.sources else '전체 출처'})")
+
     name = args.name or f"{'-'.join(criteria.genres[:2]) or 'mix'}-{args.length // 60}min"
     with _open_db(settings) as db:
+        from music_crawler.providers import local
+
+        report = local.sync(settings, db)
+        print("\n".join(report.lines()))
+
+        if random_genres:
+            count = max(1, int(random_genres.group(1) or 1))
+            pool = filter_candidates(db, criteria)
+            criteria = dataclasses.replace(
+                criteria,
+                genres=pick_random_genres(pool, args.length, count, random.Random(args.seed)),
+            )
+            print(f"랜덤 장르 선택: {', '.join(criteria.genres)}")
+            name = args.name or f"{'-'.join(criteria.genres[:2])}-{args.length // 60}min"
+
         playlist, notes = pl.create(
             settings,
             db,
@@ -307,14 +360,39 @@ def cmd_make(args, settings: Settings) -> int:
             seed=args.seed,
             tolerance=args.tolerance,
         )
+
+        # Online catalogs are queried only when the selected music does not cover the target.
+        for source in download_from:
+            if playlist.length(settings.crossfade_seconds) >= args.length:
+                break
+            try:
+                _sync_make_source(source, settings, db, profile)
+            except Exception as exc:  # keep other selected providers available
+                notes.append(f"{source} 자동 수집 실패: {exc}")
+                print(f"⚠️  {source} 자동 수집 실패: {exc}")
+            notes.extend(
+                playlist.fill(settings, db, seed=args.seed, tolerance=args.tolerance)
+            )
+
+        # Keep the requested genre and source filters, but relax mood only as a last resort.
+        if playlist.length(settings.crossfade_seconds) < args.length and criteria.moods:
+            print("요청한 mood 후보가 부족하여 다른 mood의 유사 장르 음원으로 길이를 보충합니다.")
+            fallback = dataclasses.replace(criteria, moods=())
+            playlist.criteria = fallback.as_dict()
+            notes.extend(
+                playlist.fill(settings, db, seed=args.seed, tolerance=args.tolerance)
+            )
+
         playlist.save(settings)
         _print_playlist(settings, db, playlist)
         for note in notes:
             print(f"⚠️  {note}")
         if not playlist.items:
             return 1
+        if playlist.length(settings.crossfade_seconds) < args.length:
+            print("⚠️  사용 가능한 음원이 부족해 목표 길이를 채우지 못했습니다.")
         if args.no_render:
-            print("\n다음: `show` 로 확인 → `remove`/`add`/`fill` 로 편집 → `render`")
+            print("\n다음: show 로 확인 → remove/add/fill 로 편집 → render")
             return 0
         print("\n다운로드 + 합치는 중…")
         try:
@@ -323,9 +401,8 @@ def cmd_make(args, settings: Settings) -> int:
             print(f"❌ {exc}")
             return 1
         print(f"\n✅ {out}\n설명란 텍스트: {playlist.folder(settings) / 'description.txt'}")
-        print("마음에 들면 `commit`, 바꾸고 싶으면 `remove N` / `add 곡` 후 `render`.")
+        print("마음에 들면 commit, 곡을 빼면 기본적으로 ban 목록에 등록됩니다.")
     return 0
-
 
 def _load(args, settings: Settings) -> Playlist:
     try:
@@ -350,8 +427,8 @@ def cmd_remove(args, settings: Settings) -> int:
             raise SystemExit(str(exc)) from None
         for item in removed:
             print(f"제거: {item.artist} - {item.title}")
-            if args.ban:
-                db.set_status(item.track_id, "banned", "user removed")
+            if not args.keep_eligible:
+                db.set_status(item.track_id, "banned", "removed from playlist by user")
         if not args.no_fill:
             for note in p.fill(settings, db, seed=args.seed):
                 print(f"⚠️  {note}")
@@ -421,6 +498,36 @@ def cmd_ban(args, settings: Settings) -> int:
                 continue
             db.set_status(hits[0].id, "banned", "user banned")
             print(f"제외 처리: {hits[0].label}")
+    return 0
+
+
+def cmd_lists(args, settings: Settings) -> int:
+    """Show globally banned tracks and tracks committed to previous mixes."""
+    with _open_db(settings) as db:
+        banned = db.all_tracks(status="banned")
+        used = [db.get(track_id) for track_id in sorted(db.used_track_ids())]
+    print(f"\nBAN LIST ({len(banned)}곡)")
+    for track in banned:
+        print(f"  {track.id}  {track.label}")
+    used = [track for track in used if track]
+    print(f"\nUSED LIST ({len(used)}곡)")
+    for track in used:
+        print(f"  {track.id}  {track.label}")
+    return 0
+
+
+def cmd_unban(args, settings: Settings) -> int:
+    with _open_db(settings) as db:
+        for ref in args.tracks:
+            hits = db.find(ref, limit=2)
+            if len(hits) != 1:
+                print(f"건너뜀(정확히 1곡이어야 함): {ref}")
+                continue
+            if hits[0].status != "banned":
+                print(f"이미 BAN 상태가 아닙니다: {hits[0].label}")
+                continue
+            db.set_status(hits[0].id, "candidate", "")
+            print(f"BAN 해제: {hits[0].label}")
     return 0
 
 
@@ -520,6 +627,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--tolerance", type=int, default=120, help="목표보다 길어도 되는 허용 초 (기본 120)"
     )
     p.add_argument("--seed", type=int, help="같은 결과를 재현하려면 지정")
+    p.add_argument(
+        "--library-only",
+        action="store_true",
+        help="library/inbox 에 직접 넣은 음원만 사용하고 외부 플랫폼은 조회하지 않음",
+    )
+    p.add_argument(
+        "--download-from",
+        default="",
+        help="후보가 부족할 때 추가 검색할 플랫폼: jamendo,openverse,youtube",
+    )
     p.add_argument("--no-render", action="store_true", help="곡만 고르고 다운로드/합치기는 나중에")
     p.set_defaults(func=cmd_make)
 
@@ -534,7 +651,8 @@ def build_parser() -> argparse.ArgumentParser:
     playlist_cmd("show", "플레이리스트 보기", cmd_show)
     sp = playlist_cmd("remove", "곡 삭제(+자동으로 길이 다시 채움)", cmd_remove)
     sp.add_argument("numbers", nargs="+", type=int, help="삭제할 번호(1부터)")
-    sp.add_argument("--ban", action="store_true", help="삭제한 곡을 앞으로도 추천하지 않음")
+    sp.add_argument("--ban", action="store_true", help=argparse.SUPPRESS)  # legacy compatibility
+    sp.add_argument("--keep-eligible", action="store_true", help="삭제한 곡을 ban 목록에 넣지 않음")
     sp.add_argument("--no-fill", action="store_true", help="삭제 후 자동 채움 안 함")
     sp.add_argument("--seed", type=int)
     sp = playlist_cmd("add", "곡 추가 (id 또는 검색어)", cmd_add)
@@ -548,6 +666,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("ban", help="곡을 영구 제외")
     sp.add_argument("tracks", nargs="+")
     sp.set_defaults(func=cmd_ban)
+    sub.add_parser("lists", help="사용 목록과 ban 목록 보기").set_defaults(func=cmd_lists)
+    sp = sub.add_parser("unban", help="ban 목록에서 곡 복구")
+    sp.add_argument("tracks", nargs="+")
+    sp.set_defaults(func=cmd_unban)
+
     sp = sub.add_parser("search", help="곡 검색")
     sp.add_argument("text")
     sp.add_argument("--limit", type=int, default=15)
