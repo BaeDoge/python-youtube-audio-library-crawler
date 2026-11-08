@@ -207,7 +207,10 @@ class Playlist:
         (folder / "description.txt").write_text(self.description(crossfade), encoding="utf-8")
         with (folder / "timeline.csv").open("w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["#", "start", "duration", "end", "duration_seconds", "artist", "title", "source", "license"])
+            writer.writerow([
+                "#", "start", "duration", "end", "duration_seconds", "artist", "title",
+                "source", "license", "source_url", "license_url",
+            ])
             trim = self.trim_for_exact(crossfade)
             for n, (start, item) in enumerate(self.timeline(crossfade), 1):
                 duration = trim if n == len(self.items) and trim else item.duration
@@ -222,6 +225,8 @@ class Playlist:
                         item.title,
                         item.source,
                         item.license,
+                        item.source_url,
+                        item.license_url,
                     ]
                 )
 

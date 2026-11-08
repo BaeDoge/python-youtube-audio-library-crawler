@@ -1,14 +1,14 @@
 """Local drop-in folder provider.
 
-Put any audio you downloaded yourself into ``library/inbox/`` (sub-folders are scanned).
-Folder names become hints: ``inbox/Jazz/Calm/song.mp3`` → genre Jazz, mood calm.
-A folder called ``pixabay`` marks files as Pixabay-licensed. An optional ``song.json`` next to
-``song.mp3`` may carry ``title, artist, genre, mood, license, license_url, source_url, vocals``.
+Put audio into library/inbox/<genre>/<mood>/. An optional source folder is supported:
+library/inbox/Pixabay/Jazz/Calm/song.mp3. Custom folder labels are retained as metadata
+when they are not part of the built-in taxonomy.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from music_crawler import licenses
@@ -24,11 +24,110 @@ from music_crawler.taxonomy import (
     normalize_moods,
 )
 
+_SOURCE_FOLDER_MARKERS = {
+    "pixabay", "jamendo", "openverse", "youtube", "youtube-audio-library",
+    "local", "manual", "user", "inbox", "download",
+}
+_MINOR_TITLE_WORDS = {
+    "a", "an", "and", "as", "at", "but", "by", "for", "in", "nor",
+    "of", "on", "or", "the", "to", "via",
+}
+
 
 def _as_list(value) -> list[str]:
     if not value:
         return []
     return [str(v) for v in value] if isinstance(value, list) else [str(value)]
+
+
+def _normalize_or_keep(values, normalizer) -> list[str]:
+    """Normalize known taxonomy labels but preserve custom user folder/sidecar values."""
+    out: list[str] = []
+    for raw in _as_list(values):
+        value = raw.strip()
+        if not value:
+            continue
+        mapped = normalizer([value]) or [value]
+        for item in mapped:
+            if item.casefold() not in {existing.casefold() for existing in out}:
+                out.append(item)
+    return out
+
+
+def _classification_folders(root: Path, path: Path) -> list[str]:
+    folders = path.relative_to(root).parts[:-1]
+    return [name for name in folders if name.strip().casefold() not in _SOURCE_FOLDER_MARKERS]
+
+
+def _humanize_title_slug(value: str) -> str:
+    words = [word.replace("_", " ").strip() for word in value.split("-") if word]
+    result = []
+    for index, word in enumerate(words):
+        lowered = word.casefold()
+        if index and lowered in _MINOR_TITLE_WORDS:
+            result.append(lowered)
+        else:
+            result.append(word[:1].upper() + word[1:])
+    return " ".join(result)
+
+
+def pixabay_filename_metadata(filename: str) -> dict[str, str] | None:
+    """Best-effort parse of Pixabay's common creator-title-numeric-ID filenames.
+
+    The creator handle's original camel-case cannot be recovered from a lowercase filename;
+    users can correct it through a same-name JSON sidecar.
+    """
+    stem = Path(filename).stem
+    parts = stem.split("-")
+    if len(parts) < 3 or not re.fullmatch(r"\d{5,8}", parts[-1]):
+        return None
+    creator_slug = parts[0].strip()
+    title_slug = "-".join(parts[1:-1]).strip()
+    if not creator_slug or not title_slug:
+        return None
+    creator = creator_slug.replace("_", " ")
+    creator = " ".join(word[:1].upper() + word[1:] for word in creator.split())
+    return {
+        "artist": creator,
+        "title": _humanize_title_slug(title_slug),
+        "pixabay_id": parts[-1],
+    }
+
+
+def discover_local_categories(root: Path) -> tuple[list[str], list[str]]:
+    """Return real genre/mood folder labels and sidecar labels for the GUI selectors."""
+    root = Path(root)
+    genres: dict[str, str] = {}
+    moods: dict[str, str] = {}
+    if not root.exists():
+        return [], []
+
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        folders = _classification_folders(root, path)
+        if folders:
+            for value in _normalize_or_keep([folders[0]], normalize_genres):
+                genres.setdefault(value.casefold(), value)
+        if len(folders) > 1:
+            for value in _normalize_or_keep([folders[1]], normalize_moods):
+                moods.setdefault(value.casefold(), value)
+
+        sidecar = path.with_suffix(".json")
+        if sidecar.exists():
+            try:
+                meta = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for value in _normalize_or_keep(meta.get("genre") or meta.get("genres"), normalize_genres):
+                genres.setdefault(value.casefold(), value)
+            for value in _normalize_or_keep(meta.get("mood") or meta.get("moods"), normalize_moods):
+                moods.setdefault(value.casefold(), value)
+
+    return (
+        sorted(genres.values(), key=str.casefold),
+        sorted(moods.values(), key=str.casefold),
+    )
 
 
 def _license_from_sidecar(value: str, folder_names: set[str]) -> tuple[str, str]:
@@ -75,29 +174,69 @@ def sync(settings: Settings, db: Database, root: Path | None = None) -> SyncRepo
                 meta = json.loads(sidecar.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 report.notes.append(f"사이드카 JSON을 읽지 못했습니다: {sidecar.name}")
-        folders = [p for p in path.relative_to(root).parts[:-1]]
-        folder_names = {f.lower() for f in folders}
+
+        folders = _classification_folders(root, path)
+        folder_names = {f.lower() for f in path.relative_to(root).parts[:-1]}
+        filename_meta = pixabay_filename_metadata(path.name)
 
         code, url = _license_from_sidecar(str(meta.get("license") or ""), folder_names)
+        if code == "user" and filename_meta:
+            # The creator-title-numeric-ID naming convention is a useful Pixabay hint.
+            code = "pixabay"
         url = str(meta.get("license_url") or url)
         if not licenses.is_allowed(code, settings.allowed_licenses):
             report.drop(f"license:{code}")
             continue
+
         duration = int(meta.get("duration") or info["duration"])
         if duration < settings.min_track_seconds:
             report.drop("too-short")
             continue
 
-        title = str(meta.get("title") or info["tags"].get("title") or path.stem).strip()
-        artist = str(meta.get("artist") or info["tags"].get("artist") or "").strip()
-        hint_text = " ".join(folders)
-        folder_genres, folder_moods = classify_text(hint_text)
-        genres = (
-            normalize_genres(_as_list(meta.get("genre") or meta.get("genres")))
-            or normalize_genres([info["tags"].get("genre", "")])
-            or folder_genres
+        title = str(
+            meta.get("title")
+            or info["tags"].get("title")
+            or (filename_meta or {}).get("title")
+            or path.stem
+        ).strip()
+        artist = str(
+            meta.get("artist")
+            or info["tags"].get("artist")
+            or (filename_meta or {}).get("artist")
+            or ""
+        ).strip()
+
+        genre_from_folder = (
+            _normalize_or_keep([folders[0]], normalize_genres) if folders else []
         )
-        moods = normalize_moods(_as_list(meta.get("mood") or meta.get("moods"))) or folder_moods
+        mood_from_folder = (
+            _normalize_or_keep([folders[1]], normalize_moods) if len(folders) > 1 else []
+        )
+        inferred_genres, inferred_moods = classify_text(" ".join(folders))
+        genres = (
+            _normalize_or_keep(meta.get("genre") or meta.get("genres"), normalize_genres)
+            or _normalize_or_keep([info["tags"].get("genre", "")], normalize_genres)
+            or genre_from_folder
+            or inferred_genres
+            or ["Other"]
+        )
+        moods = (
+            _normalize_or_keep(meta.get("mood") or meta.get("moods"), normalize_moods)
+            or _normalize_or_keep([info["tags"].get("mood", "")], normalize_moods)
+            or mood_from_folder
+            or inferred_moods
+        )
+        tags = _as_list(meta.get("tags"))
+        if filename_meta:
+            tags.extend([
+                "pixabay",
+                f"pixabay-id:{filename_meta['pixabay_id']}",
+            ])
+            report.notes.append(
+                f"Pixabay 파일명 인식: {path.name} → {artist} - {title} "
+                f"(ID {filename_meta['pixabay_id']}; 표기 대소문자는 sidecar로 수정 가능)"
+            )
+
         batch.append(
             Track(
                 id=f"local:{digest[:12]}",
@@ -106,9 +245,10 @@ def sync(settings: Settings, db: Database, root: Path | None = None) -> SyncRepo
                 title=title,
                 artist=artist,
                 duration=duration,
-                genres=genres or ["Other"],
+                genres=genres,
                 moods=moods,
-                vocals=detect_vocals(title, [], meta.get("vocals")),
+                tags=list(dict.fromkeys(tags)),
+                vocals=detect_vocals(title, tags, meta.get("vocals")),
                 license=code,
                 license_url=url,
                 source_url=str(meta.get("source_url") or ""),

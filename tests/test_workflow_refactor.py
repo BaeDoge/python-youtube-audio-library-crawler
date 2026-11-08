@@ -38,6 +38,7 @@ def test_timeline_reports_trimmed_final_track_duration(settings):
     p.write_text_outputs(settings, 3)
     rows = (p.folder(settings) / "timeline.csv").read_text(encoding="utf-8-sig").splitlines()
     assert rows[0].startswith("#,start,duration,end,duration_seconds")
+    assert rows[0].endswith(",source_url,license_url")
     assert ",01:37,00:33,02:10,33," in rows[2]
 
 

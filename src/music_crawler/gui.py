@@ -18,6 +18,7 @@ from music_crawler.config import Settings
 from music_crawler.db import Database
 from music_crawler.playlist import Playlist, fmt_time
 from music_crawler.providers import local
+from music_crawler.providers.local import discover_local_categories
 from music_crawler.selector import Criteria
 from music_crawler.taxonomy import GENRES, MOODS, load_profiles
 
@@ -222,15 +223,55 @@ class MusicLibraryApp:
                   style="CardTitle.TLabel").pack(anchor="w")
         ttk.Label(mood_box, text="선택하지 않으면 전체 무드",
                   style="Muted.TLabel").pack(anchor="w", pady=(3, 7))
-        self.genre_list = self._make_listbox(genre_box, GENRES, height=9)
-        self.mood_list = self._make_listbox(mood_box, MOODS, height=9)
-        defaults = {"Jazz", "NewAge", "Classical", "Ambient", "Piano", "Acoustic", "Lounge"}
-        for index, genre in enumerate(GENRES):
-            if genre in defaults:
-                self.genre_list.selection_set(index)
-        for index, mood in enumerate(MOODS):
-            if mood in {"calm", "peaceful", "warm", "dreamy", "romantic", "melancholy"}:
-                self.mood_list.selection_set(index)
+        # Add category names found in the user's actual inbox folder tree.
+        folder_genres, folder_moods = discover_local_categories(self.settings.inbox_dir)
+        self.available_genres = list(GENRES)
+        self.available_moods = list(MOODS)
+        genre_keys = {value.casefold() for value in self.available_genres}
+        mood_keys = {value.casefold() for value in self.available_moods}
+        self.available_genres.extend(
+            value for value in folder_genres if value.casefold() not in genre_keys
+        )
+        self.available_moods.extend(
+            value for value in folder_moods if value.casefold() not in mood_keys
+        )
+
+        ttk.Label(
+            genre_box,
+            text=f"내 폴더에서 발견한 장르 포함 · {len(self.available_genres)}개",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(0, 5))
+        ttk.Label(
+            mood_box,
+            text=f"내 폴더에서 발견한 무드 포함 · {len(self.available_moods)}개",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(0, 5))
+        self.genre_list = self._make_listbox(genre_box, self.available_genres, height=9)
+        self.mood_list = self._make_listbox(mood_box, self.available_moods, height=9)
+        self.genre_list.selection_set(0, END)
+        self.mood_list.selection_set(0, END)
+
+        genre_actions = ttk.Frame(genre_box, style="Card.TFrame")
+        genre_actions.pack(fill="x", pady=(5, 0))
+        ttk.Button(
+            genre_actions, text="전체 선택",
+            command=lambda: self.genre_list.selection_set(0, END),
+        ).pack(side="left")
+        ttk.Button(
+            genre_actions, text="선택 해제",
+            command=lambda: self.genre_list.selection_clear(0, END),
+        ).pack(side="left", padx=(6, 0))
+
+        mood_actions = ttk.Frame(mood_box, style="Card.TFrame")
+        mood_actions.pack(fill="x", pady=(5, 0))
+        ttk.Button(
+            mood_actions, text="전체 선택",
+            command=lambda: self.mood_list.selection_set(0, END),
+        ).pack(side="left")
+        ttk.Button(
+            mood_actions, text="선택 해제",
+            command=lambda: self.mood_list.selection_clear(0, END),
+        ).pack(side="left", padx=(6, 0))
 
         source_card = ttk.Frame(card, style="Card.TFrame")
         source_card.pack(fill="x", pady=(10, 0))
@@ -295,8 +336,15 @@ class MusicLibraryApp:
             messagebox.showerror("길이 확인", "목표 길이는 1 이상의 정수(분)로 입력하세요.",
                                  parent=self.root)
             return
-        genres = tuple(GENRES[i] for i in self.genre_list.curselection())
-        moods = tuple(MOODS[i] for i in self.mood_list.curselection())
+        selected_genres = tuple(
+            self.available_genres[i] for i in self.genre_list.curselection()
+        )
+        selected_moods = tuple(
+            self.available_moods[i] for i in self.mood_list.curselection()
+        )
+        # Selecting every item means no category filter; this also includes future folders.
+        genres = () if len(selected_genres) == len(self.available_genres) else selected_genres
+        moods = () if len(selected_moods) == len(self.available_moods) else selected_moods
         online = [name for name, var in self.provider_vars.items() if var.get()] \
             if self.source_mode.get() == "online" else []
         if self.source_mode.get() == "online" and not online:
@@ -388,8 +436,24 @@ class MusicLibraryApp:
         card = self._card(self.content, padding=20)
         card.pack(fill="both", expand=True)
         self._section_label(card, "내 음원")
-        ttk.Label(card, text="음원 파일을 library/inbox/장르/무드/ 폴더에 넣으세요.",
-                  style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(
+            card,
+            text=(
+                "음원 파일을 library/inbox/장르/무드/ 폴더에 넣으세요. "
+                "Pixabay 파일명은 스캔할 때 제작자·곡명·음원 ID를 자동 추출합니다."
+            ),
+            style="Muted.TLabel",
+            wraplength=880,
+        ).pack(anchor="w")
+        ttk.Label(
+            card,
+            text=(
+                "예: inbox/Pixabay/City Pop/Night/파일.mp3  ·  "
+                "파일명은 유지하고, 정리된 곡 정보만 라이브러리와 유튜브 타임라인에 반영합니다."
+            ),
+            style="Muted.TLabel",
+            wraplength=880,
+        ).pack(anchor="w", pady=(5, 0))
         actions = ttk.Frame(card, style="Card.TFrame")
         actions.pack(fill="x", pady=(12, 22))
         ttk.Button(actions, text="음원 넣을 폴더 열기",
