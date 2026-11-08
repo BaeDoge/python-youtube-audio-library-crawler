@@ -55,6 +55,45 @@ workspace/
 
 직접 받은 곡은 `library/inbox/<장르>/<무드>/`에 넣습니다. 예를 들어 `library/inbox/Jazz/Calm/song.mp3`처럼 저장하면 폴더명을 장르와 무드 분류 힌트로 사용합니다. 파일 옆에 같은 이름의 JSON sidecar를 두면 제목, 아티스트, 라이선스, 출처 URL을 직접 지정할 수 있습니다.
 
+### Pixabay에서 수동으로 받은 음원 정리
+
+Pixabay에서 곡을 하나씩 직접 다운로드하는 흐름은 유지하되, 파일을 라이브러리에 넣은 뒤 곡 정보 정리는 자동화할 수 있습니다.
+
+권장 폴더 구조:
+
+```text
+library/inbox/
+└── Pixabay/
+    └── City Pop/
+        └── Night Drive/
+            └── mellowbeansmusic-city-pop-sparks-beneath-the-overpass-349357.mp3
+```
+
+메뉴의 **음원 라이브러리 → 내 음원 다시 읽기**를 누르면 다음 순서로 정보를 정리합니다.
+
+1. MP3의 ID3/파일 메타데이터에 제목·아티스트가 있으면 우선 사용합니다.
+2. 메타데이터가 없고 `제작자-곡명-숫자ID.mp3` 형식이면 파일명에서 제작자, 곡명, Pixabay ID를 추정합니다.
+3. 폴더의 첫 두 분류명을 장르·무드로 등록합니다. 기본 택소노미에 없는 사용자 정의 폴더명도 보존하며 믹스 만들기 화면에 나타납니다.
+4. 원본 파일 이름은 바꾸지 않습니다. 정리한 곡명·아티스트만 믹스의 `description.txt`와 `timeline.csv`에 사용합니다.
+
+예시 파일은 `Mellowbeansmusic - City Pop Sparks Beneath the Overpass`로 우선 인식됩니다. 다만 파일명은 제작자 핸들의 대소문자를 보존하지 않으므로, Pixabay 페이지의 표기대로 `MellowBeansMusic`를 사용하고 싶다면 같은 폴더에 동일한 파일명의 `.json` 사이드카를 만들어 아래처럼 덮어쓸 수 있습니다.
+
+```json
+{
+  "title": "[City Pop] Sparks Beneath the Overpass",
+  "artist": "MellowBeansMusic",
+  "genre": "City Pop",
+  "mood": "Night Drive",
+  "license": "pixabay",
+  "source_url": "https://pixabay.com/ko/music/실제-음원-페이지-주소/"
+}
+```
+
+`source_url`에는 해당 곡의 실제 Pixabay 페이지 주소를 복사해 넣으세요. 곡명과 아티스트는 사이드카 값이 파일명이나 MP3 태그보다 우선합니다.
+
+**Pixabay 자동 크롤링에 대해서:** 현재 공식 Pixabay API 문서에는 이미지·동영상 검색만 설명되어 있고 음악 검색 API는 문서화되어 있지 않습니다. 약관은 허가되지 않은 자동 데이터 수집·스크래핑과 허가 없는 대량·체계적 콘텐츠 복사를 금지합니다. 따라서 검색 결과 페이지를 긁거나 다운로드 URL을 역으로 추출하는 기능은 넣지 않습니다. 안전하고 손이 덜 가는 최소 흐름은 사람이 곡을 다운로드하고, 이 프로그램이 파일명/태그/폴더를 정리해 믹스 구간 정보까지 생성하는 방식입니다. [Pixabay API 문서](https://pixabay.com/api/docs/), [Pixabay 서비스 약관](https://pixabay.com/service/terms/)
+
+
 ## 3. 믹스 생성 방식 선택
 
 ### 보유 음원만 사용
