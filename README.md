@@ -1,169 +1,60 @@
 # Music Library
 
-외부 무료 음원 카탈로그와 직접 보유한 음원을 한 곳에서 관리하고, 원하는 길이의 배경음악 파일로 구성하는 개인용 음원 라이브러리입니다.
+A Python desktop and command-line tool for organising music and creating background-music mixes that fit a target video duration.
 
-주요 기능은 음원 수집, 장르·무드별 분류, 목표 길이에 맞춘 믹스 생성, 구간별 타임라인 출력, 제외곡 관리입니다. 믹스 생성과 편집 외의 쇼츠 보조 기능은 포함하지 않습니다.
+The application can use a local music collection and selected external catalogs, then prepare an editable playlist and render a combined audio file.
 
-## 데스크톱 메뉴
+## Features
 
-명령어를 직접 입력하지 않고 사용하려면 다음 명령으로 선택형 메뉴 창을 여세요.
+- Import and manage local audio files
+- Collect catalog metadata from Jamendo and Openverse
+- Optional YouTube Audio Library integration
+- Organise tracks by genre, mood, instruments, vocals, and license metadata
+- Select tracks to fit a target duration
+- Edit playlists by adding, removing, and reordering tracks
+- Apply crossfades and optionally trim the final track to a target length
+- Export a merged audio file, track timeline, and attribution information
+- Use either the desktop menu or CLI
 
-```bash
-uv run music-crawler menu
-```
+## Technology
 
-창에는 **믹스 만들기**, **음원 라이브러리**, **믹스 검토 및 수정**, **사용 / 제외 목록**, **환경 및 폴더** 다섯 항목만 배치했습니다. 믹스 생성 화면에서 길이·장르·무드를 선택하고, 보유 음원만 사용할지 Jamendo·Openverse·YouTube Audio Library를 추가 조회할지 정할 수 있습니다. 긴 수집·렌더링 작업은 별도 작업 창에서 진행 상황을 표시합니다. 기존 CLI 명령어도 그대로 사용할 수 있습니다.
+- Python 3.11+
+- uv
+- SQLite
+- HTTPX
+- FFmpeg and ffprobe
+- Playwright (optional, for YouTube Audio Library integration)
 
-Windows/macOS Python 배포판에는 Tkinter가 일반적으로 포함되어 있습니다. Linux에서는 배포판에 따라 `python3-tk` 설치가 필요할 수 있습니다.
+## Requirements
 
-## 1. 준비
+Install Python 3.11 or later, uv, FFmpeg, and ffprobe. Make sure the FFmpeg executables are available on PATH.
 
-필수 환경은 Python 3.11 이상과 `ffmpeg`, `ffprobe`입니다.
+## Install
 
-```bash
-uv sync
-uv run music-crawler init
-uv run music-crawler doctor
-```
+    git clone https://github.com/BaeDoge/python-youtube-audio-library-crawler.git
+    cd python-youtube-audio-library-crawler
+    uv sync
 
-플랫폼을 사용할 때만 `.env`에 해당 인증 정보를 입력합니다.
+To enable the optional YouTube Audio Library provider, install the optional dependency group and configure an authenticated Chrome session as described in the project configuration.
 
-- Jamendo: `JAMENDO_CLIENT_ID`
-- Openverse: 인증 정보 없이도 제한적으로 동작하며, 더 높은 한도가 필요하면 `OPENVERSE_CLIENT_ID`, `OPENVERSE_CLIENT_SECRET`
-- YouTube Audio Library: `pip install -e ".[youtube]"`, 로그인된 Chrome 원격 디버깅 세션 및 `YOUTUBE_CHANNEL_ID`
+## Start the desktop menu
 
-## 2. 폴더 사용법
+    uv run music-crawler menu
 
-`music-crawler init` 실행 후 생성되는 런타임 폴더만 사용하면 됩니다.
+The menu provides access to mix creation, the music library, playlist review and editing, include/exclude lists, and application settings.
 
-```text
-workspace/
-├── .env                       # 선택 플랫폼의 인증 정보
-├── config/
-│   └── profiles.toml          # 선택 수집 프로필(선택)
-├── data/
-│   └── music.db               # 곡 메타데이터, 사용 목록, ban 목록
-├── library/
-│   ├── inbox/                 # 직접 받은 음원을 넣는 곳
-│   │   └── Jazz/Calm/song.mp3
-│   ├── jamendo/               # 플랫폼에서 받은 음원
-│   ├── openverse/
-│   └── youtube/
-└── output/
-    └── playlists/             # 통합 음원과 구간 정보
-```
+## CLI
 
-직접 받은 곡은 `library/inbox/<장르>/<무드>/`에 넣습니다. 예를 들어 `library/inbox/Jazz/Calm/song.mp3`처럼 저장하면 폴더명을 장르와 무드 분류 힌트로 사용합니다. 파일 옆에 같은 이름의 JSON sidecar를 두면 제목, 아티스트, 라이선스, 출처 URL을 직접 지정할 수 있습니다.
+    uv run music-crawler --help
 
-### Pixabay에서 수동으로 받은 음원 정리
+The CLI supports library initialisation and synchronisation, playlist creation, review, editing, and rendering. Use the help output for the available commands and options.
 
-Pixabay에서 곡을 하나씩 직접 다운로드하는 흐름은 유지하되, 파일을 라이브러리에 넣은 뒤 곡 정보 정리는 자동화할 수 있습니다.
+## Output
 
-권장 폴더 구조:
+Rendered mixes and their associated metadata are stored under the configured playlists output directory. A typical output includes the combined audio file, a track timeline, and credits for tracks that require attribution.
 
-```text
-library/inbox/
-└── Pixabay/
-    └── City Pop/
-        └── Night Drive/
-            └── mellowbeansmusic-city-pop-sparks-beneath-the-overpass-349357.mp3
-```
+## Licensing
 
-메뉴의 **음원 라이브러리 → 내 음원 다시 읽기**를 누르면 다음 순서로 정보를 정리합니다.
+License metadata and automatic filters help organise music sources, but they do not guarantee usage rights. Before publishing or monetising a video, review the current terms of the source platform and the licence of every selected track. Include attribution where required.
 
-1. MP3의 ID3/파일 메타데이터에 제목·아티스트가 있으면 우선 사용합니다.
-2. 메타데이터가 없고 `제작자-곡명-숫자ID.mp3` 형식이면 파일명에서 제작자, 곡명, Pixabay ID를 추정합니다.
-3. 폴더의 첫 두 분류명을 장르·무드로 등록합니다. 기본 택소노미에 없는 사용자 정의 폴더명도 보존하며 믹스 만들기 화면에 나타납니다.
-4. 원본 파일 이름은 바꾸지 않습니다. 정리한 곡명·아티스트만 믹스의 `description.txt`와 `timeline.csv`에 사용합니다.
-
-예시 파일은 `Mellowbeansmusic - City Pop Sparks Beneath the Overpass`로 우선 인식됩니다. 다만 파일명은 제작자 핸들의 대소문자를 보존하지 않으므로, Pixabay 페이지의 표기대로 `MellowBeansMusic`를 사용하고 싶다면 같은 폴더에 동일한 파일명의 `.json` 사이드카를 만들어 아래처럼 덮어쓸 수 있습니다.
-
-```json
-{
-  "title": "[City Pop] Sparks Beneath the Overpass",
-  "artist": "MellowBeansMusic",
-  "genre": "City Pop",
-  "mood": "Night Drive",
-  "license": "pixabay",
-  "source_url": "https://pixabay.com/ko/music/실제-음원-페이지-주소/"
-}
-```
-
-`source_url`에는 해당 곡의 실제 Pixabay 페이지 주소를 복사해 넣으세요. 곡명과 아티스트는 사이드카 값이 파일명이나 MP3 태그보다 우선합니다.
-
-**Pixabay 자동 크롤링에 대해서:** 현재 공식 Pixabay API 문서에는 이미지·동영상 검색만 설명되어 있고 음악 검색 API는 문서화되어 있지 않습니다. 약관은 허가되지 않은 자동 데이터 수집·스크래핑과 허가 없는 대량·체계적 콘텐츠 복사를 금지합니다. 따라서 검색 결과 페이지를 긁거나 다운로드 URL을 역으로 추출하는 기능은 넣지 않습니다. 안전하고 손이 덜 가는 최소 흐름은 사람이 곡을 다운로드하고, 이 프로그램이 파일명/태그/폴더를 정리해 믹스 구간 정보까지 생성하는 방식입니다. [Pixabay API 문서](https://pixabay.com/api/docs/), [Pixabay 서비스 약관](https://pixabay.com/service/terms/)
-
-
-## 3. 믹스 생성 방식 선택
-
-### 보유 음원만 사용
-
-외부 사이트를 조회하지 않고 `library/inbox`에 직접 넣은 음원만 사용합니다.
-
-```bash
-uv run music-crawler make 60 --genre jazz,newage --mood calm --library-only
-```
-
-### 외부 플랫폼을 선택해 자동 확장
-
-우선 현재 라이브러리에서 곡을 고릅니다. 목표 길이에 부족할 때 지정한 플랫폼을 추가 조회하고, 새 후보를 반영해 길이를 다시 채웁니다. 실제 선택된 곡은 믹스 렌더링 단계에서 자동 다운로드됩니다.
-
-```bash
-uv run music-crawler make 60 --genre jazz,newage --mood calm --download-from jamendo,openverse
-uv run music-crawler make 30 --genre piano,ambient --mood dreamy --download-from youtube
-```
-
-지원 플랫폼은 `jamendo`, `openverse`, `youtube`입니다. 여러 플랫폼은 쉼표로 구분합니다. YouTube는 로그인된 Chrome 세션이 필요합니다. 인증 정보가 없는 플랫폼이나 수집에 실패한 플랫폼은 경고를 남기고 다음 플랫폼을 계속 시도합니다.
-
-무드 후보가 충분하지 않으면 먼저 선택한 곡은 유지하면서 같은 장르·출처 조건 안에서 다른 무드의 곡을 추가해 길이를 보충합니다. 그래도 길이가 부족하면 가능한 곡만으로 믹스를 만들고 부족한 길이를 알려줍니다.
-
-`--download-from`과 `--library-only`는 함께 사용할 수 없습니다. 두 옵션을 생략하면 기존 DB 카탈로그를 사용합니다. DB에 저장된 외부 곡은 렌더링 시 파일이 없으면 다운로드합니다.
-
-## 4. 편집 및 확정
-
-```bash
-uv run music-crawler show
-uv run music-crawler remove 3 5       # 선택 곡 제거 + 자동 재충전 + 전역 BAN 등록
-uv run music-crawler render           # 편집 결과로 다시 생성
-uv run music-crawler commit           # 최종 사용 곡을 USED 목록에 등록
-uv run music-crawler lists            # BAN / USED 목록 확인
-uv run music-crawler unban jamendo:123 # BAN 해제
-```
-
-삭제한 곡은 기본적으로 전역 BAN 목록에 등록되어 이후 믹스에 다시 등장하지 않습니다. 현재 믹스에서만 제외하고 싶다면 `remove 3 --keep-eligible`를 사용합니다. 자동 재충전을 원하지 않으면 `--no-fill`을 추가할 수 있습니다.
-
-최종 믹스를 확인한 뒤 `commit`해야 해당 곡들이 USED 목록에 등록됩니다. USED 곡은 기본적으로 다음 믹스 후보에서 제외됩니다.
-
-## 5. 결과 파일
-
-`output/playlists/<날짜_이름>/`에 생성됩니다.
-
-- `mix.mp3`: 최종 통합 음원
-- `tracks/`: 번호가 붙은 개별 곡 파일
-- `playlist.m3u8`: 개별 곡 재생목록
-- `description.txt`: 유튜브 설명란에 넣을 수 있는 구간별 곡 목록과 크레딧
-- `timeline.csv`: 곡별 시작·종료 시각, 재생 길이(초), 출처 및 라이선스
-- `credits.txt`: 저작자 표시가 필요한 곡의 크레딧
-- `playlist.json`: 편집 가능한 플레이리스트 상태
-
-곡 사이는 크로스페이드로 자연스럽게 연결하고, 마지막 곡에는 길이 자르기 여부와 관계없이 약 5초 페이드아웃을 적용합니다. `--exact`가 기본 활성화되어 마지막 곡을 잘라 목표 길이에 맞춥니다.
-
-## 6. 라이브러리 관리
-
-```bash
-uv run music-crawler sync local
-uv run music-crawler sync jamendo
-uv run music-crawler sync openverse
-uv run music-crawler sync youtube
-uv run music-crawler stats --genre all --mood all
-uv run music-crawler search "검색어"
-uv run music-crawler ban jamendo:123
-uv run music-crawler unban jamendo:123
-uv run music-crawler lists
-```
-
-Jamendo는 태그별 커서를 저장해 다음 실행에서 이어서 수집합니다. 각 공급자는 라이선스, 오디오 길이, 보컬 정보 등을 확인해 후보에 등록합니다.
-
-## 라이선스 주의
-
-라이선스 자동 필터는 위험을 줄이는 보조 수단이지 사용 권리를 보증하지 않습니다. 게시 또는 수익화 전에 각 음원의 라이선스와 플랫폼 약관을 확인하세요. CC BY 등 저작자 표시가 필요한 음원은 생성된 `description.txt` 또는 `credits.txt`의 크레딧을 함께 사용해야 합니다. Jamendo API 및 YouTube Audio Library의 접근·사용 조건도 실제 사용 목적에 맞게 확인해야 합니다.
+The YouTube Audio Library provider relies on an authenticated YouTube Studio browser session and internal web endpoints. Those endpoints are not a stable public API and may change without notice.
